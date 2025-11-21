@@ -30,11 +30,16 @@ src/radiation/
 from radiation import (
     STEFAN_BOLTZMANN,          # Stefan-Boltzmann 常数
     SOLAR_CONSTANT,            # 太阳辐射常数
-    AIR_DENSITY,               # 空气密度
     SPECIFIC_HEAT_AIR,         # 空气比热容
+    GAS_CONSTANT_DRY_AIR,      # 干空气气体常数
+    STANDARD_PRESSURE,         # 标准大气压
     LATENT_HEAT_VAPORIZATION,  # 水汽化潜热
     PSYCHROMETRIC_CONSTANT     # 干湿计常数
 )
+
+# 注意：空气密度不再是常量，而是通过函数计算
+from aerodynamics import calculate_air_density
+rho = calculate_air_density(air_temperature, surface_pressure)
 ```
 
 ### 2. `solar_radiation.py` - 太阳辐射计算
@@ -396,7 +401,85 @@ pip install -r requirements.txt
    - 验证各通量的合理范围
    - 对比实测数据验证
 
+## ERA5-Land 数据集成
+
+### 概述
+
+本模块已集成ERA5-Land再分析数据集，用于提供大气参数。**重要**：近地表气温Ta是模型待估计参数，不使用ERA5-Land的气温数据。
+
+### 使用的ERA5-Land参数
+
+#### 必需参数
+
+| ERA5-Land Band | 变量 | 用途 | 单位 |
+|---------------|------|------|------|
+| `surface_pressure` | 地表气压 P | 计算空气密度 ρ(Ta) = P/(R_d×Ta) | Pa |
+| `dewpoint_temperature_2m` | 2米露点温度 Td | 计算实际水汽压 ea | K |
+| `u_component_of_wind_10m` | U风速分量 | 计算风速和阻抗 | m/s |
+| `v_component_of_wind_10m` | V风速分量 | 计算风速和阻抗 | m/s |
+
+#### 使用示例
+
+```python
+from aerodynamics import (
+    calculate_air_density,
+    calculate_actual_vapor_pressure_from_dewpoint,
+    calculate_wind_speed
+)
+
+# 1. 从ERA5-Land获取数据
+P = era5_data['surface_pressure']          # Pa
+Td = era5_data['dewpoint_temperature_2m']  # K
+u = era5_data['u_component_of_wind_10m']   # m/s
+v = era5_data['v_component_of_wind_10m']   # m/s
+
+# 2. 计算派生参数（不依赖气温Ta）
+ea = calculate_actual_vapor_pressure_from_dewpoint(Td)
+wind_speed = calculate_wind_speed(u, v)
+
+# 3. 对于给定的气温Ta（待估计），计算空气密度
+Ta = 298.15  # 示例值，实际应通过优化估计
+rho = calculate_air_density(Ta, P)
+```
+
+### 不使用的ERA5-Land参数
+
+❌ **temperature_2m**: 近地表气温Ta是模型待估计参数，不使用ERA5数据  
+❌ **total_evaporation**: 保持当前模型物理逻辑，从能量平衡计算  
+❌ **longwave radiation**: 从气温和大气参数化公式计算
+
+### 气温依赖关系
+
+所有依赖气温Ta的物理量都表示为Ta的函数：
+
+1. **空气密度**: ρ(Ta) = P / (R_d × Ta)
+2. **长波下行辐射**: L↓(Ta) = εa × σ × Ta⁴
+3. **净辐射**: Q*(Ta) = (1-α)S↓ + ε₀L↓(Ta) - L↑
+4. **感热通量**: QH(Ta) = ρ(Ta) × Cp × (Ta-Ts) / rah
+5. **潜热通量**: QE(Ta) = ρ(Ta) × Cp × (es-ea) / [γ(rah+rs)]
+
+详细的气温依赖关系文档请参见：[AIR_TEMPERATURE_DEPENDENCIES.md](../../doc/AIR_TEMPERATURE_DEPENDENCIES.md)
+
+### 数据获取
+
+ERA5-Land数据可通过以下方式获取：
+- **Google Earth Engine**: `ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY")`
+- **Copernicus Climate Data Store**: https://cds.climate.copernicus.eu/
+- **时间分辨率**: 每小时
+- **空间分辨率**: 0.1° × 0.1° (约11km)
+- **时间范围**: 1950年至近实时（延迟约3个月）
+
+---
+
 ## 常见问题
+
+**Q: 为什么不使用ERA5-Land的气温数据？**
+
+A: 近地表气温Ta是本模型的核心待估计参数。通过迭代最小二乘法估计Ta，可以使能量平衡方程在所有像元上达到最优闭合。ERA5-Land气温的空间分辨率（11km）远低于遥感数据（30-100m），不适合高分辨率城市研究。
+
+**Q: 露点温度如何转换为实际水汽压？**
+
+A: 使用Magnus公式：ea = 0.6108 × exp[17.27×Td/(Td+237.3)]，其中Td是露点温度（℃）。这比使用相对湿度更直接准确。
 
 **Q: 为什么透射率使用高程修正？**
 

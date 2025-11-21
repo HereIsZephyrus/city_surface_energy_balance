@@ -7,116 +7,101 @@
     QE = ρCp(es - ea) / [γ(rah + rs)]
 
 其中:
-    - es: 地表温度对应的饱和水汽压 (kPa)
-    - ea: 近地表实际水汽压 (kPa)
+    - es: 地表温度对应的饱和水汽压 (kPa) - 由aerodynamics模块计算
+    - ea: 近地表实际水汽压 (kPa) - 由aerodynamics模块计算
     - γ: 干湿计常数 ≈ 0.067 kPa/K
-    - rah: 大气湍流热交换阻抗 (s/m)
-    - rs: 下垫面植被阻抗/表面阻抗 (s/m)
+    - rah: 大气湍流热交换阻抗 (s/m) - 由aerodynamics模块计算
+    - rs: 下垫面植被阻抗/表面阻抗 (s/m) - 由aerodynamics模块计算
+
+注意:
+    本模块仅负责根据已知参数计算潜热通量，所有空气动力学参数
+    （如水汽压、阻抗等）应由aerodynamics模块计算后传入。
 """
 
 import numpy as np
 from .constants import (
-    AIR_DENSITY,
     SPECIFIC_HEAT_AIR,
     LATENT_HEAT_VAPORIZATION,
     PSYCHROMETRIC_CONSTANT
 )
 
+
 class LatentHeatFluxCalculator:
     """
     潜热通量计算器
-
+    
     Formula: QE = ρCp(es - ea) / [γ(rah + rs)]
-
+    
     where:
     - es: 地表温度对应的饱和水汽压 (kPa)
     - ea: 近地表实际水汽压 (kPa)
-    - γ: 干湿计常数 ≈ Cp/(λ×ε) ≈ 0.067 kPa/K
+    - γ: 干湿计常数 ≈ 0.067 kPa/K
     - rah: 大气湍流热交换阻抗 (s/m)
     - rs: 下垫面植被阻抗/表面阻抗 (s/m)
+    
+    注意:
+        所有空气动力学参数（es, ea, rah, rs）应由外部（aerodynamics模块）
+        计算后传入，本计算器仅执行潜热通量公式计算。
     """
-
+    
     def __init__(self,
-                 surface_temperature: np.ndarray,
+                 saturation_vapor_pressure: np.ndarray,
                  actual_vapor_pressure: np.ndarray,
                  aerodynamic_resistance: np.ndarray,
                  surface_resistance: np.ndarray,
-                 air_density: float = AIR_DENSITY,
+                 air_density: float,
                  specific_heat: float = SPECIFIC_HEAT_AIR,
                  latent_heat: float = LATENT_HEAT_VAPORIZATION):
         """
         初始化潜热通量计算器
-
+        
         Parameters:
-            surface_temperature: 地表温度 Ts (K) - ndarray
+            saturation_vapor_pressure: 地表温度对应的饱和水汽压 es (kPa) - ndarray
             actual_vapor_pressure: 近地表实际水汽压 ea (kPa) - ndarray
+                                  推荐从ERA5-Land的dewpoint_temperature_2m计算
             aerodynamic_resistance: 大气湍流热交换阻抗 rah (s/m) - ndarray
             surface_resistance: 表面阻抗 rs (s/m) - ndarray
-            air_density: 空气密度 (kg/m³) - scalar
+            air_density: 空气密度 ρ (kg/m³) - scalar
+                        使用ERA5-Land气温计算的参考值
             specific_heat: 空气定压比热容 (J/kg/K) - scalar
             latent_heat: 水的汽化潜热 (J/kg) - scalar
+        
+        注意:
+            - saturation_vapor_pressure: 通过aerodynamics.calculate_saturation_vapor_pressure(Ts)
+            - actual_vapor_pressure: 推荐使用aerodynamics.calculate_actual_vapor_pressure_from_dewpoint(Td)
+              从ERA5-Land的dewpoint_temperature_2m直接计算
+            - air_density使用参考值（标量），numpy广播机制自动处理
         """
-        self.Ts = surface_temperature
+        self.es = saturation_vapor_pressure
         self.ea = actual_vapor_pressure
         self.rah = aerodynamic_resistance
         self.rs = surface_resistance
         self.rho = air_density
         self.Cp = specific_heat
         self.lambda_v = latent_heat
-
-    @property
-    def saturation_vapor_pressure(self) -> np.ndarray:
-        """
-        计算饱和水汽压（Magnus公式）
-
-        Formula: es = 0.6108 × exp[17.27(Ts - 273.15)/(Ts - 35.85)]
-
-        Returns:
-            饱和水汽压 es (kPa) - ndarray
-        """
-        Ts_celsius = self.Ts - 273.15
-        es = 0.6108 * np.exp(17.27 * Ts_celsius / (Ts_celsius + 237.3))
-        return es
-
-    @property
-    def psychrometric_constant(self) -> float:
-        """
-        计算干湿计常数
-
-        Formula: γ = Cp / (λ × ε) ≈ 0.067 kPa/K
-        where ε = 0.622 (水汽分子量/干空气分子量)
-
-        Returns:
-            干湿计常数 γ (kPa/K) - scalar
-        """
-        # 使用标准值（标准大气压条件下）
-        return PSYCHROMETRIC_CONSTANT
-
+    
     @property
     def latent_heat_flux(self) -> np.ndarray:
         """
         计算潜热通量
-
+        
         Formula: QE = ρCp(es - ea) / [γ(rah + rs)]
-
+        
         Returns:
             潜热通量 QE (W/m²) - ndarray
         """
-        es = self.saturation_vapor_pressure
-        gamma = self.psychrometric_constant
-
         # 避免除以零
         total_resistance = self.rah + self.rs
         total_resistance_safe = np.maximum(total_resistance, 1.0)
-
+        
         # 计算潜热通量
         # 注意：需要将kPa转换为Pa，并考虑干湿计常数
         # QE = ρCp(es - ea) / [γ(rah + rs)]
-        # 这里gamma已经包含了单位转换
-        QE = (self.rho * self.Cp * (es - self.ea) * 1000 / 
-              (gamma * total_resistance_safe))
-
+        # gamma已经包含了单位转换
+        QE = (self.rho * self.Cp * (self.es - self.ea) * 1000 / 
+              (PSYCHROMETRIC_CONSTANT * total_resistance_safe))
+        
         # 限制潜热通量为非负值（蒸发）
         QE = np.maximum(QE, 0.0)
-
+        
         return QE.astype(np.float32)

@@ -1,152 +1,239 @@
 """
 能量平衡方程模块
 
-协调各个能量通量计算器，完成完整的地表能量平衡计算。
+计算能量平衡方程的系数和残差，用于街区级回归分析。
+
+核心思想:
+    不需要Ta的具体值，将能量平衡分解为：
+    f(Ta) = coeff_Ta × Ta + residual = 0
+    
+    然后在街区聚合后，通过ALS回归求解每个街区的Ta。
 
 能量平衡方程:
-    Q* = ΔQSg + QH + QE
+    Q* - ΔQSg - QH - QE = 0
 
-其中:
-    - Q*: 净辐射 (W/m²)
-    - ΔQSg: 土壤热通量 (W/m²)
-    - QH: 感热通量 (W/m²)
-    - QE: 潜热通量 (W/m²)
+分解为:
+    [Q*_coeff - QH_coeff]×Ta + [Q*_const - ΔQSg - QH_const - QE] = 0
+    即: f_Ta_coeff×Ta + residual = 0
 
-基于 SEBAL 模型实现。
+参考:
+    doc/晴朗无风条件下城市生态空间对城市降温作用量化模型.md
 """
 
-from typing import Optional
 import numpy as np
+from typing import Dict, Optional
 from .calc_net_radiation import NetRadiationCalculator
 from .calc_soil_heat import SoilHeatFluxCalculator
 from .calc_sensible_heat import SensibleHeatFluxCalculator
 from .calc_latent_heat import LatentHeatFluxCalculator
+from .constants import STEFAN_BOLTZMANN, GAS_CONSTANT_DRY_AIR
 
-def calculate_energy_balance(shortwave_down: np.ndarray,
-                            surface_temperature: np.ndarray,
-                            air_temperature: float,
-                            elevation: np.ndarray,
-                            albedo: np.ndarray,
-                            ndvi: np.ndarray,
-                            aerodynamic_resistance: np.ndarray,
-                            surface_resistance: np.ndarray,
-                            actual_vapor_pressure: np.ndarray,
-                            surface_emissivity: Optional[np.ndarray] = None,
-                            impervious_mask: Optional[np.ndarray] = None) -> dict:
+
+def calculate_air_density(
+    surface_pressure: np.ndarray,
+    era5_air_temperature: np.ndarray
+) -> float:
     """
-    计算完整的能量平衡
+    计算空气密度的参考值（使用ERA5-Land气温）
+    
+    ρ = P / (R_d × Ta)
+    
+    参数:
+        surface_pressure: 地表气压 P (Pa) - ndarray
+        era5_air_temperature: ERA5-Land气温 (K) - ndarray或scalar
+    
+    返回:
+        平均空气密度 (kg/m³) - scalar
+    """
+    P_mean = np.mean(surface_pressure)
+    Ta_mean = np.mean(era5_air_temperature)
+    rho = P_mean / (GAS_CONSTANT_DRY_AIR * Ta_mean)
+    return float(rho)
 
-    Workflow:
-    1. 计算净辐射 Q*
-    2. 计算土壤热通量 ΔQSg
-    3. 计算感热通量 QH
-    4. 计算潜热通量 QE (从能量平衡残差)
 
-    Energy Balance: Q* = ΔQSg + QH + QE
-
-    Parameters:
+def calculate_energy_balance_coefficients(
+    shortwave_down: np.ndarray,
+    surface_temperature: np.ndarray,
+    elevation: np.ndarray,
+    albedo: np.ndarray,
+    ndvi: np.ndarray,
+    saturation_vapor_pressure: np.ndarray,
+    actual_vapor_pressure: np.ndarray,
+    aerodynamic_resistance: np.ndarray,
+    surface_resistance: np.ndarray,
+    surface_emissivity: np.ndarray,
+    surface_pressure: np.ndarray,
+    era5_air_temperature: np.ndarray,
+    impervious_mask: Optional[np.ndarray] = None
+) -> Dict[str, np.ndarray]:
+    """
+    计算能量平衡方程关于Ta的总系数和残差
+    
+    将能量平衡分解为：
+    f(Ta) = coeff_Ta × Ta + residual = 0
+    
+    参数:
         shortwave_down: 短波下行辐射 (W/m²) - ndarray
-        surface_temperature: 地表温度 (K) - ndarray
-        air_temperature: 近地表气温 (K) - scalar
+        surface_temperature: 地表温度 Ts (K) - ndarray
         elevation: 高程 (m) - ndarray
-        albedo: 地表反照率 (0-1) - ndarray
-        ndvi: 归一化植被指数 - ndarray
-        aerodynamic_resistance: 大气湍流热交换阻抗 (s/m) - ndarray
-        surface_resistance: 表面阻抗 (s/m) - ndarray
-        actual_vapor_pressure: 近地表实际水汽压 (kPa) - ndarray
-        surface_emissivity: 地表发射率 (0-1) - ndarray, 可选
-        impervious_mask: 不透水面掩膜 - ndarray, 可选
-
-    Returns:
-        dict containing:
-        - net_radiation: 净辐射 Q* (W/m²)
-        - soil_heat_flux: 土壤热通量 ΔQSg (W/m²)
-        - sensible_heat_flux: 感热通量 QH (W/m²)
-        - latent_heat_flux: 潜热通量 QE (W/m²)
-        - energy_balance_residual: 能量平衡残差 (W/m²)
-        - longwave_down: 长波下行辐射 (W/m²)
-        - longwave_up: 长波上行辐射 (W/m²)
+        albedo: 反照率 - ndarray
+        ndvi: NDVI - ndarray
+        saturation_vapor_pressure: es (kPa) - ndarray
+        actual_vapor_pressure: ea (kPa) - ndarray
+        aerodynamic_resistance: rah (s/m) - ndarray
+        surface_resistance: rs (s/m) - ndarray
+        surface_emissivity: ε₀ - ndarray
+        surface_pressure: P (Pa) - ndarray
+        era5_air_temperature: ERA5-Land气温 (K) - ndarray或scalar
+                             用于空气密度计算和系数线性化
+        impervious_mask: 不透水面mask - ndarray, optional
+    
+    返回:
+        {
+            'f_Ta_coeff': 总系数 ∂f/∂Ta (W/m²/K),
+            'residual': 残差项 (W/m²),
+            'era5_air_temperature': ERA5气温 (K) - 用于Ta初始化和参考
+            
+            # 分项（调试用）
+            'Q_star_coeff': ∂Q*/∂Ta,
+            'QH_coeff': ∂QH/∂Ta,
+            'Q_star_const': Q*的常数部分,
+            'soil_heat_flux': ΔQSg,
+            'latent_heat_flux': QE
+        }
+    
+    注意:
+        能量平衡方程: f(Ta) = 0
+        即: f_Ta_coeff×Ta + residual = 0
     """
-    # Step 1: 计算净辐射
+    # 步骤1: 计算空气密度参考值（使用ERA5气温）
+    rho_ref = calculate_air_density(surface_pressure, era5_air_temperature)
+    
+    # 获取参考气温（用于系数计算）
+    ta_reference = float(np.mean(era5_air_temperature))
+    
+    # 步骤2: 计算净辐射系数
     net_rad_calc = NetRadiationCalculator(
         shortwave_down=shortwave_down,
         surface_temperature=surface_temperature,
-        air_temperature=air_temperature,
         elevation=elevation,
         albedo=albedo,
-        surface_emissivity=surface_emissivity
+        surface_emissivity=surface_emissivity,
+        ta_reference=ta_reference
     )
-
-    Q_star = net_rad_calc.net_radiation
-    L_down = net_rad_calc.longwave_down
-    L_up = net_rad_calc.longwave_up
-
-    # Step 2: 计算土壤热通量
+    Q_star_coeffs = net_rad_calc.net_radiation_coefficient
+    
+    # 步骤3: 计算感热通量系数
+    sensible_calc = SensibleHeatFluxCalculator(
+        surface_temperature=surface_temperature,
+        aerodynamic_resistance=aerodynamic_resistance,
+        air_density=rho_ref
+    )
+    QH_coeffs = sensible_calc.sensible_heat_coefficient
+    
+    # 步骤4: 计算土壤热通量 ΔQSg（不依赖Ta）
+    # 使用参考气温计算Q*₀来估算
+    L_up = surface_emissivity * STEFAN_BOLTZMANN * (surface_temperature ** 4)
+    epsilon_a = net_rad_calc.atmospheric_emissivity
+    L_down_ref = epsilon_a * STEFAN_BOLTZMANN * (ta_reference ** 4)
+    
+    Q_star_ref = (
+        (1 - albedo) * shortwave_down +
+        surface_emissivity * L_down_ref -
+        L_up
+    )
+    
     soil_flux_calc = SoilHeatFluxCalculator(
-        net_radiation=Q_star,
+        net_radiation=Q_star_ref,
         surface_temperature=surface_temperature,
         albedo=albedo,
-        ndvi=ndvi,
-        impervious_mask=impervious_mask
+        ndvi=ndvi
     )
-
-    delta_QSg = soil_flux_calc.soil_heat_flux
-
-    # Step 3: 计算感热通量
-    sensible_calc = SensibleHeatFluxCalculator(
-        air_temperature=air_temperature,
-        surface_temperature=surface_temperature,
-        aerodynamic_resistance=aerodynamic_resistance
-    )
-
-    QH = sensible_calc.sensible_heat_flux
-
-    # Step 4: 计算潜热通量
-    latent_calc = LatentHeatFluxCalculator(
-        surface_temperature=surface_temperature,
+    Delta_QSg = soil_flux_calc.soil_heat_flux
+    
+    # 不透水面的土壤热通量为0
+    if impervious_mask is not None:
+        Delta_QSg = np.where(impervious_mask, 0.0, Delta_QSg)
+    
+    # 步骤5: 计算潜热通量 QE（不依赖Ta）
+    latent_flux_calc = LatentHeatFluxCalculator(
+        saturation_vapor_pressure=saturation_vapor_pressure,
         actual_vapor_pressure=actual_vapor_pressure,
         aerodynamic_resistance=aerodynamic_resistance,
-        surface_resistance=surface_resistance
+        surface_resistance=surface_resistance,
+        air_density=rho_ref
     )
-
-    QE = latent_calc.latent_heat_flux
-
-    # 能量平衡检验: Q* = ΔQSg + QH + QE
-    energy_balance_residual = Q_star - (delta_QSg + QH + QE)
-
+    QE = latent_flux_calc.latent_heat_flux
+    
+    # 步骤6: 组合系数和残差
+    # 能量平衡方程: Q* - ΔQSg - QH - QE = 0
+    # 展开: [Q_star_coeff×Ta + Q_star_const] - ΔQSg - [QH_coeff×Ta + QH_const] - QE = 0
+    # 整理: [Q_star_coeff - QH_coeff]×Ta + [Q_star_const - ΔQSg - QH_const - QE] = 0
+    
+    f_Ta_coeff = Q_star_coeffs['coeff'] - QH_coeffs['coeff']
+    residual = Q_star_coeffs['const'] - Delta_QSg - QH_coeffs['const'] - QE
+    
+    # 返回结果
     return {
-        'net_radiation': Q_star,
-        'soil_heat_flux': delta_QSg,
-        'sensible_heat_flux': QH,
-        'latent_heat_flux': QE,
-        'energy_balance_residual': energy_balance_residual,
-        'longwave_down': L_down,
-        'longwave_up': L_up,
-        'available_energy': Q_star - delta_QSg  # 可用能量
+        # 主要输出（用于街区回归）
+        'f_Ta_coeff': f_Ta_coeff.astype(np.float32),
+        'residual': residual.astype(np.float32),
+        'era5_air_temperature': np.asarray(era5_air_temperature).astype(np.float32),
+        
+        # 分项输出（用于调试和分析）
+        'Q_star_coeff': Q_star_coeffs['coeff'],
+        'Q_star_const': Q_star_coeffs['const'],
+        'QH_coeff': QH_coeffs['coeff'],
+        'QH_const': QH_coeffs['const'],
+        'soil_heat_flux': Delta_QSg.astype(np.float32),
+        'latent_heat_flux': QE.astype(np.float32)
     }
 
 
-def calculate_evaporative_fraction(latent_heat_flux: np.ndarray,
-                                   available_energy: np.ndarray) -> np.ndarray:
+def validate_energy_balance(
+    f_Ta_coeff: np.ndarray,
+    residual: np.ndarray,
+    ta_test: float = 298.15
+) -> None:
     """
-    计算蒸散发比 (Evaporative Fraction)
-
-    Formula: EF = λE / (Q* - G)
-
-    Parameters:
-        latent_heat_flux: 潜热通量 QE (W/m²)
-        available_energy: 可用能量 Q* - G (W/m²)
-
-    Returns:
-        蒸散发比 EF (0-1) - ndarray
+    验证系数计算的合理性
+    
+    参数:
+        f_Ta_coeff: Ta系数栅格 (W/m²/K)
+        residual: 残差栅格 (W/m²)
+        ta_test: 测试用的Ta值 (K)
     """
-    # 避免除以零
-    available_energy_safe = np.maximum(available_energy, 1.0)
-
-    EF = latent_heat_flux / available_energy_safe
-
-    # 限制在0-1之间
-    EF = np.clip(EF, 0.0, 1.0)
-
-    return EF.astype(np.float32)
-
+    print("\n" + "=" * 70)
+    print("能量平衡系数验证")
+    print("=" * 70)
+    
+    print("\n【Ta系数统计】 (∂f/∂Ta)")
+    print(f"  平均值: {np.mean(f_Ta_coeff):>8.3f} W/m²/K")
+    print(f"  标准差: {np.std(f_Ta_coeff):>8.3f} W/m²/K")
+    print(f"  最小值: {np.min(f_Ta_coeff):>8.3f} W/m²/K")
+    print(f"  最大值: {np.max(f_Ta_coeff):>8.3f} W/m²/K")
+    
+    print("\n【残差统计】 (不依赖Ta的部分)")
+    print(f"  平均值: {np.mean(residual):>8.2f} W/m²")
+    print(f"  标准差: {np.std(residual):>8.2f} W/m²")
+    print(f"  最小值: {np.min(residual):>8.2f} W/m²")
+    print(f"  最大值: {np.max(residual):>8.2f} W/m²")
+    
+    # 测试：用Ta_test计算能量平衡
+    balance = f_Ta_coeff * ta_test + residual
+    print(f"\n【使用Ta={ta_test:.2f}K时的能量平衡】")
+    print(f"  f(Ta) 平均: {np.mean(balance):>8.2f} W/m²")
+    print(f"  f(Ta) 标准差: {np.std(balance):>8.2f} W/m²")
+    print("  理想情况: f(Ta) 应接近 0 W/m²")
+    
+    # 估算Ta使能量平衡为0
+    Ta_estimate = -residual / f_Ta_coeff
+    Ta_valid = Ta_estimate[(Ta_estimate > 273.15) & (Ta_estimate < 323.15)]
+    
+    if len(Ta_valid) > 0:
+        print("\n【估算Ta使f(Ta)=0】")
+        print(f"  平均Ta: {np.mean(Ta_valid):>8.2f} K ({np.mean(Ta_valid)-273.15:>5.2f}°C)")
+        print(f"  标准差: {np.std(Ta_valid):>8.2f} K")
+        print(f"  范围: [{np.min(Ta_valid)-273.15:>5.2f}, {np.max(Ta_valid)-273.15:>5.2f}]°C")
+    
+    print("=" * 70 + "\n")
