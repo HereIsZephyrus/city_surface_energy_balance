@@ -12,7 +12,7 @@
 主要功能:
 - 太阳辐射计算（考虑地形效应）
 - 净辐射系数计算（∂Q*/∂Ta）
-- 土壤热通量计算（不依赖Ta）
+- 储热通量计算（自然表面SEBAL / 不透水面ALS回归特征）
 - 感热通量系数计算（∂QH/∂Ta）
 - 潜热通量计算（不依赖Ta）
 - 能量平衡系数计算（用于街区回归）
@@ -21,7 +21,7 @@
 - constants: 物理常量定义
 - solar_radiation: 太阳辐射计算
 - calc_net_radiation: 净辐射系数计算器
-- calc_soil_heat: 土壤热通量计算器
+- calc_soil_heat: 储热通量计算器（LCZ分类：自然SEBAL/不透水ALS回归）
 - calc_sensible_heat: 感热通量系数计算器
 - calc_latent_heat: 潜热通量计算器
 - balance_equation: 能量平衡系数计算函数
@@ -57,7 +57,7 @@ from .solar_radiation import (
 
 # 能量通量计算器
 from .calc_net_radiation import NetRadiationCalculator
-from .calc_soil_heat import SoilHeatFluxCalculator
+from .calc_soil_heat import StorageHeatFluxCalculator
 from .calc_sensible_heat import SensibleHeatFluxCalculator
 from .calc_latent_heat import LatentHeatFluxCalculator
 
@@ -66,6 +66,9 @@ from .balance_equation import (
     calculate_energy_balance_coefficients,
     validate_energy_balance
 )
+
+# 工作流
+from .workflow import calculate_energy_balance
 
 # I/O 功能
 from .raster_io import load_dem, save_radiation
@@ -93,13 +96,16 @@ __all__ = [
 
     # 能量通量计算器
     'NetRadiationCalculator',
-    'SoilHeatFluxCalculator',
+    'StorageHeatFluxCalculator',
     'SensibleHeatFluxCalculator',
     'LatentHeatFluxCalculator',
 
     # 能量平衡系数计算（用于街区回归）
     'calculate_energy_balance_coefficients',
     'validate_energy_balance',
+    
+    # 工作流
+    'calculate_energy_balance',
 
     # I/O 功能
     'load_dem',

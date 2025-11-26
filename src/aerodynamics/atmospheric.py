@@ -17,13 +17,11 @@
 """
 
 import numpy as np
-from typing import Union
-
 
 def calculate_air_density(
-        air_temperature: Union[float, np.ndarray],
-        surface_pressure: Union[float, np.ndarray],
-        gas_constant: float = 287.0) -> Union[float, np.ndarray]:
+        air_temperature: np.ndarray,
+        surface_pressure: np.ndarray,
+        gas_constant: float = 287.0) -> np.ndarray:
     """
     计算空气密度（作为气温和气压的函数）
     
@@ -60,11 +58,7 @@ def calculate_air_density(
     # 理想气体状态方程
     rho = surface_pressure / (gas_constant * air_temperature)
     
-    # 类型转换（如果是ndarray）
-    if isinstance(rho, np.ndarray):
-        return rho.astype(np.float32)
-    else:
-        return float(rho)
+    return rho.astype(np.float32)
 
 
 def calculate_wind_speed(
@@ -97,37 +91,6 @@ def calculate_wind_speed(
     U = np.sqrt(u_component**2 + v_component**2)
     
     return U.astype(np.float32)
-
-
-def calculate_wind_direction(
-        u_component: np.ndarray,
-        v_component: np.ndarray) -> np.ndarray:
-    """
-    从风速分量计算风向（可选功能）
-    
-    公式: θ = arctan2(v, u)
-    
-    参数:
-        u_component: 东西向风速分量 u (m/s) - ndarray
-        v_component: 南北向风速分量 v (m/s) - ndarray
-    
-    返回:
-        风向 θ (度) - ndarray, 范围0-360°
-        北风=0°, 东风=90°, 南风=180°, 西风=270°
-    
-    数据源:
-        ERA5-Land bands:
-        - 'u_component_of_wind_10m' (m/s)
-        - 'v_component_of_wind_10m' (m/s)
-    """
-    # 计算风向（弧度）
-    theta_rad = np.arctan2(v_component, u_component)
-    
-    # 转换为度（0-360）
-    theta_deg = np.degrees(theta_rad)
-    theta_deg = (90 - theta_deg) % 360  # 转换为气象风向（北风=0°）
-    
-    return theta_deg.astype(np.float32)
 
 
 def adjust_wind_speed_height(
@@ -175,4 +138,3 @@ def adjust_wind_speed_height(
     U_target = np.maximum(U_target, 0.1)  # 最小风速0.1 m/s
     
     return U_target.astype(np.float32)
-

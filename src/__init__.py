@@ -67,9 +67,9 @@ from .regression import (
 )
 
 from .utils import (
+    RasterBand,
     RasterCollection,
-    load_raster,
-    save_raster
+    RasterData,
 )
 
 __all__ = [
@@ -90,7 +90,6 @@ __all__ = [
     'DistrictAggregator',
     'DistrictRegressionModel',
     'RasterCollection',
-    'load_raster',
-    'save_raster',
+    'RasterData',
 ]
 

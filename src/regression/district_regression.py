@@ -32,23 +32,8 @@ from pathlib import Path
 from sklearn.linear_model import LinearRegression
 from scipy.optimize import minimize
 import warnings
-
-try:
-    from rasterio import features
-    from rasterio.transform import from_bounds
-    import rasterio
-    HAS_RASTERIO = True
-except ImportError:
-    HAS_RASTERIO = False
-    warnings.warn("未安装rasterio，栅格处理功能受限")
-
-try:
-    from rasterstats import zonal_stats
-    HAS_RASTERSTATS = True
-except ImportError:
-    HAS_RASTERSTATS = False
-    warnings.warn("未安装rasterstats，建议安装: pip install rasterstats")
-
+import rasterio
+from rasterstats import zonal_stats
 
 class DistrictAggregator:
     """

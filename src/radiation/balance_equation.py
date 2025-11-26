@@ -21,9 +21,9 @@
 """
 
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict
 from .calc_net_radiation import NetRadiationCalculator
-from .calc_soil_heat import SoilHeatFluxCalculator
+from .calc_soil_heat import StorageHeatFluxCalculator
 from .calc_sensible_heat import SensibleHeatFluxCalculator
 from .calc_latent_heat import LatentHeatFluxCalculator
 from .constants import STEFAN_BOLTZMANN, GAS_CONSTANT_DRY_AIR
@@ -64,7 +64,7 @@ def calculate_energy_balance_coefficients(
     surface_emissivity: np.ndarray,
     surface_pressure: np.ndarray,
     era5_air_temperature: np.ndarray,
-    impervious_mask: Optional[np.ndarray] = None
+    lcz: np.ndarray
 ) -> Dict[str, np.ndarray]:
     """
     计算能量平衡方程关于Ta的总系数和残差
@@ -72,39 +72,40 @@ def calculate_energy_balance_coefficients(
     将能量平衡分解为：
     f(Ta) = coeff_Ta × Ta + residual = 0
     
+    储热通量根据 LCZ 分类:
+    - 自然表面: SEBAL 公式直接计算，计入 residual
+    - 不透水面: 返回 storage_feature，系数 β 在 ALS 回归中估计
+    
     参数:
-        shortwave_down: 短波下行辐射 (W/m²) - ndarray
-        surface_temperature: 地表温度 Ts (K) - ndarray
-        elevation: 高程 (m) - ndarray
-        albedo: 反照率 - ndarray
-        ndvi: NDVI - ndarray
-        saturation_vapor_pressure: es (kPa) - ndarray
-        actual_vapor_pressure: ea (kPa) - ndarray
-        aerodynamic_resistance: rah (s/m) - ndarray
-        surface_resistance: rs (s/m) - ndarray
-        surface_emissivity: ε₀ - ndarray
-        surface_pressure: P (Pa) - ndarray
-        era5_air_temperature: ERA5-Land气温 (K) - ndarray或scalar
-                             用于空气密度计算和系数线性化
-        impervious_mask: 不透水面mask - ndarray, optional
+        shortwave_down: 短波下行辐射 (W/m²)
+        surface_temperature: 地表温度 Ts (K)
+        elevation: 高程 (m)
+        albedo: 反照率
+        ndvi: NDVI
+        saturation_vapor_pressure: es (kPa)
+        actual_vapor_pressure: ea (kPa)
+        aerodynamic_resistance: rah (s/m)
+        surface_resistance: rs (s/m)
+        surface_emissivity: ε₀
+        surface_pressure: P (Pa)
+        era5_air_temperature: ERA5-Land气温 (K)
+        lcz: LCZ分类栅格 (1-14)
     
     返回:
         {
             'f_Ta_coeff': 总系数 ∂f/∂Ta (W/m²/K),
             'residual': 残差项 (W/m²),
-            'era5_air_temperature': ERA5气温 (K) - 用于Ta初始化和参考
+            'era5_air_temperature': ERA5气温 (K),
+            'storage_feature': 储热回归特征 (W/m²)
+                              不透水面 = Q*, 自然表面 = 0
             
             # 分项（调试用）
             'Q_star_coeff': ∂Q*/∂Ta,
             'QH_coeff': ∂QH/∂Ta,
             'Q_star_const': Q*的常数部分,
-            'soil_heat_flux': ΔQSg,
+            'storage_heat_flux': 自然表面 SEBAL 计算的 ΔQ_Sg,
             'latent_heat_flux': QE
         }
-    
-    注意:
-        能量平衡方程: f(Ta) = 0
-        即: f_Ta_coeff×Ta + residual = 0
     """
     # 步骤1: 计算空气密度参考值（使用ERA5气温）
     rho_ref = calculate_air_density(surface_pressure, era5_air_temperature)
@@ -131,7 +132,7 @@ def calculate_energy_balance_coefficients(
     )
     QH_coeffs = sensible_calc.sensible_heat_coefficient
     
-    # 步骤4: 计算土壤热通量 ΔQSg（不依赖Ta）
+    # 步骤4: 计算储热通量（不依赖Ta）
     # 使用参考气温计算Q*₀来估算
     L_up = surface_emissivity * STEFAN_BOLTZMANN * (surface_temperature ** 4)
     epsilon_a = net_rad_calc.atmospheric_emissivity
@@ -143,17 +144,19 @@ def calculate_energy_balance_coefficients(
         L_up
     )
     
-    soil_flux_calc = SoilHeatFluxCalculator(
+    # 使用 LCZ 分类计算储热
+    # - 自然表面: SEBAL 公式直接计算 ΔQ_Sg
+    # - 不透水面: 返回储热特征 X_storage，系数由 ALS 回归确定
+    storage_calc = StorageHeatFluxCalculator(
         net_radiation=Q_star_ref,
         surface_temperature=surface_temperature,
         albedo=albedo,
-        ndvi=ndvi
+        ndvi=ndvi,
+        lcz=lcz
     )
-    Delta_QSg = soil_flux_calc.soil_heat_flux
-    
-    # 不透水面的土壤热通量为0
-    if impervious_mask is not None:
-        Delta_QSg = np.where(impervious_mask, 0.0, Delta_QSg)
+    # 获取自然表面的储热通量和不透水面的储热特征
+    Delta_Q_storage = storage_calc.storage_heat_flux  # 自然表面SEBAL，不透水面=0
+    storage_feature = storage_calc.storage_feature    # 不透水面Q*，自然表面=0
     
     # 步骤5: 计算潜热通量 QE（不依赖Ta）
     latent_flux_calc = LatentHeatFluxCalculator(
@@ -166,12 +169,12 @@ def calculate_energy_balance_coefficients(
     QE = latent_flux_calc.latent_heat_flux
     
     # 步骤6: 组合系数和残差
-    # 能量平衡方程: Q* - ΔQSg - QH - QE = 0
-    # 展开: [Q_star_coeff×Ta + Q_star_const] - ΔQSg - [QH_coeff×Ta + QH_const] - QE = 0
-    # 整理: [Q_star_coeff - QH_coeff]×Ta + [Q_star_const - ΔQSg - QH_const - QE] = 0
+    # 能量平衡方程: Q* - ΔQ_storage - QH - QE = 0
+    # 展开: [Q_star_coeff×Ta + Q_star_const] - ΔQ_storage - [QH_coeff×Ta + QH_const] - QE = 0
+    # 整理: [Q_star_coeff - QH_coeff]×Ta + [Q_star_const - ΔQ_storage - QH_const - QE] = 0
     
     f_Ta_coeff = Q_star_coeffs['coeff'] - QH_coeffs['coeff']
-    residual = Q_star_coeffs['const'] - Delta_QSg - QH_coeffs['const'] - QE
+    residual = Q_star_coeffs['const'] - Delta_Q_storage - QH_coeffs['const'] - QE
     
     # 返回结果
     return {
@@ -180,12 +183,18 @@ def calculate_energy_balance_coefficients(
         'residual': residual.astype(np.float32),
         'era5_air_temperature': np.asarray(era5_air_temperature).astype(np.float32),
         
+        # 储热回归特征（用于 ALS 回归）
+        # 在 ALS 中: f(Ta) + β·storage_feature = 0
+        # storage_feature = Q* (不透水面), 0 (自然表面)
+        'storage_feature': storage_feature.astype(np.float32),
+        
         # 分项输出（用于调试和分析）
         'Q_star_coeff': Q_star_coeffs['coeff'],
         'Q_star_const': Q_star_coeffs['const'],
         'QH_coeff': QH_coeffs['coeff'],
         'QH_const': QH_coeffs['const'],
-        'soil_heat_flux': Delta_QSg.astype(np.float32),
+        'storage_heat_flux': Delta_Q_storage.astype(np.float32),  # 自然表面SEBAL结果
+        'soil_heat_flux': Delta_Q_storage.astype(np.float32),     # 保留旧名以兼容
         'latent_heat_flux': QE.astype(np.float32)
     }
 

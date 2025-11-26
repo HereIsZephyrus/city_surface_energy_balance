@@ -7,6 +7,7 @@
 - 饱和水汽压计算
 - 实际水汽压计算（从相对湿度或露点温度）
 - 露点温度空间降尺度（基于土地覆盖和FVC）
+- DEM空间降尺度（基于ERA5气压约束）
 - 空气密度计算（作为气温的函数）
 - 风速计算（从ERA5-Land风速分量）
 - 大气阻抗计算（rah - 大气湍流热交换阻抗）
@@ -42,10 +43,13 @@ from .dewpoint_downscaling import (
     sensitivity_analysis
 )
 
+from .dem_downscaling import (
+    adjust_pressure_for_elevation
+)
+
 from .atmospheric import (
     calculate_air_density,
     calculate_wind_speed,
-    calculate_wind_direction,
     adjust_wind_speed_height
 )
 
@@ -58,6 +62,11 @@ from .constants import (
     LCZ_OBUKHOV_LENGTH,
     DEFAULT_OBUKHOV_LENGTH,
     get_obukhov_length_from_lcz
+)
+
+from .workflow import (
+    calculate_aerodynamic_parameters,
+    calculate_roughness_from_lcz
 )
 
 # Note: roughness calculation has been moved to landscape module
@@ -75,10 +84,11 @@ __all__ = [
     'validate_downscaling',
     'print_validation_report',
     'sensitivity_analysis',
+    # DEM降尺度
+    'adjust_pressure_for_elevation',
     # 大气参数计算
     'calculate_air_density',
     'calculate_wind_speed',
-    'calculate_wind_direction',
     'adjust_wind_speed_height',
     # 阻抗计算
     'calculate_aerodynamic_resistance',
@@ -87,5 +97,8 @@ __all__ = [
     'LCZ_OBUKHOV_LENGTH',
     'DEFAULT_OBUKHOV_LENGTH',
     'get_obukhov_length_from_lcz',
+    # 工作流
+    'calculate_aerodynamic_parameters',
+    'calculate_roughness_from_lcz',
 ]
 
