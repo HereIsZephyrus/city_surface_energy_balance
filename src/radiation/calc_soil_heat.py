@@ -7,7 +7,7 @@
 
 在 ALS 回归框架中:
     f(Ta) + β·X_storage = 0
-    
+
     其中:
     - X_storage = Q* (对于不透水面)
     - X_storage = 0 (对于自然表面，已用 SEBAL 计算)
@@ -30,7 +30,7 @@ from ..utils import LCZ_NEEDS_STORAGE_REGRESSION
 class StorageHeatFluxCalculator:
     """
     地面/建筑储热通量计算器
-    
+
     根据 LCZ 类型自动选择计算方法:
     - 自然表面: SEBAL 公式直接计算 ΔQ_Sg
     - 不透水面: 返回储热特征 X_storage，系数由 ALS 回归确定
@@ -46,7 +46,7 @@ class StorageHeatFluxCalculator:
     ):
         """
         初始化储热通量计算器
-        
+
         参数:
             net_radiation: 净辐射 Q* (W/m²)
             surface_temperature: 地表温度 Ts (K)
@@ -63,23 +63,23 @@ class StorageHeatFluxCalculator:
     def _calculate_sebal_flux(self) -> np.ndarray:
         """
         使用 SEBAL 公式计算自然表面的土壤热通量
-        
+
         公式: ΔQ_Sg = Q* × (Ts-273.15)/α × (0.0038α + 0.0074α²) × (1-0.98NDVI⁴)
         """
         Ts_celsius = self.Ts - 273.15
         albedo_safe = np.maximum(self.albedo, 0.01)
-        
+
         ratio = (Ts_celsius / albedo_safe *
                 (0.0038 * albedo_safe + 0.0074 * albedo_safe**2) *
                 (1 - 0.98 * self.ndvi**4))
-        
+
         delta_Q = self.Q_star * ratio
         return np.clip(delta_Q, 0, 0.5 * np.abs(self.Q_star))
 
     def _get_regression_mask(self) -> np.ndarray:
         """
         获取需要储热回归的像素掩码
-        
+
         返回:
             bool数组: True = 不透水面（需要回归），False = 自然表面（用SEBAL）
         """
@@ -93,9 +93,9 @@ class StorageHeatFluxCalculator:
     def storage_heat_flux(self) -> np.ndarray:
         """
         计算自然表面的储热通量（SEBAL）
-        
+
         注意: 不透水面的储热在此设为 0，其储热系数将在 ALS 回归中估计
-        
+
         返回:
             储热通量 (W/m²) - 自然表面为 ΔQ_Sg，不透水面为 0
         """
@@ -108,9 +108,9 @@ class StorageHeatFluxCalculator:
     def storage_feature(self) -> np.ndarray:
         """
         获取储热回归特征 X_storage
-        
+
         用于 ALS 回归: f(Ta) + β·X_storage = 0
-        
+
         返回:
             储热特征 (W/m²):
             - 不透水面: Q* (作为回归特征)
@@ -123,7 +123,7 @@ class StorageHeatFluxCalculator:
     def get_flux_and_feature(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         同时返回储热通量和回归特征
-        
+
         返回:
             (storage_flux, storage_feature):
             - storage_flux: 自然表面的 SEBAL 计算结果，不透水面为 0

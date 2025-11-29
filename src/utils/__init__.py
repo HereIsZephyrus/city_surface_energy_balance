@@ -9,6 +9,7 @@ from .raster_manager import (
     RasterCollection,
     RasterData,
 )
+from .cached_collection import CachedRasterCollection
 
 from .mapping import (
     ERA5_BANDS,
@@ -25,6 +26,11 @@ from .mapping import (
     is_urban,
     is_natural,
     use_sebal_formula,
+    # ALS 回归特征定义
+    ANTHROPOGENIC_HEAT_FEATURES,
+    STORAGE_HEAT_FEATURES,
+    HORIZONTAL_EXCHANGE_FEATURES,
+    ALS_FEATURE_GROUPS,
 )
 
 __all__ = [
@@ -32,11 +38,12 @@ __all__ = [
     'RasterBand',
     'RasterCollection',
     'RasterData',
-    
+    'CachedRasterCollection',
+
     # 波段映射
     'ERA5_BANDS',
     'LANDSAT_BANDS',
-    
+
     # LCZ配置
     'LCZ',
     'LCZ_ROUGHNESS',
@@ -50,5 +57,11 @@ __all__ = [
     'is_urban',
     'is_natural',
     'use_sebal_formula',
+
+    # ALS 回归特征定义
+    'ANTHROPOGENIC_HEAT_FEATURES',
+    'STORAGE_HEAT_FEATURES',
+    'HORIZONTAL_EXCHANGE_FEATURES',
+    'ALS_FEATURE_GROUPS',
 ]
 

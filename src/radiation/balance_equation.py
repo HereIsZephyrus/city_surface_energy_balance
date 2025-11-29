@@ -6,7 +6,7 @@
 核心思想:
     不需要Ta的具体值，将能量平衡分解为：
     f(Ta) = coeff_Ta × Ta + residual = 0
-    
+
     然后在街区聚合后，通过ALS回归求解每个街区的Ta。
 
 能量平衡方程:
@@ -35,18 +35,18 @@ def calculate_air_density(
 ) -> float:
     """
     计算空气密度的参考值（使用ERA5-Land气温）
-    
+
     ρ = P / (R_d × Ta)
-    
+
     参数:
         surface_pressure: 地表气压 P (Pa) - ndarray
         era5_air_temperature: ERA5-Land气温 (K) - ndarray或scalar
-    
+
     返回:
         平均空气密度 (kg/m³) - scalar
     """
-    P_mean = np.mean(surface_pressure)
-    Ta_mean = np.mean(era5_air_temperature)
+    P_mean = np.nanmean(surface_pressure)
+    Ta_mean = np.nanmean(era5_air_temperature)
     rho = P_mean / (GAS_CONSTANT_DRY_AIR * Ta_mean)
     return float(rho)
 
@@ -68,14 +68,14 @@ def calculate_energy_balance_coefficients(
 ) -> Dict[str, np.ndarray]:
     """
     计算能量平衡方程关于Ta的总系数和残差
-    
+
     将能量平衡分解为：
     f(Ta) = coeff_Ta × Ta + residual = 0
-    
+
     储热通量根据 LCZ 分类:
     - 自然表面: SEBAL 公式直接计算，计入 residual
     - 不透水面: 返回 storage_feature，系数 β 在 ALS 回归中估计
-    
+
     参数:
         shortwave_down: 短波下行辐射 (W/m²)
         surface_temperature: 地表温度 Ts (K)
@@ -90,7 +90,7 @@ def calculate_energy_balance_coefficients(
         surface_pressure: P (Pa)
         era5_air_temperature: ERA5-Land气温 (K)
         lcz: LCZ分类栅格 (1-14)
-    
+
     返回:
         {
             'f_Ta_coeff': 总系数 ∂f/∂Ta (W/m²/K),
@@ -98,7 +98,7 @@ def calculate_energy_balance_coefficients(
             'era5_air_temperature': ERA5气温 (K),
             'storage_feature': 储热回归特征 (W/m²)
                               不透水面 = Q*, 自然表面 = 0
-            
+
             # 分项（调试用）
             'Q_star_coeff': ∂Q*/∂Ta,
             'QH_coeff': ∂QH/∂Ta,
@@ -109,10 +109,10 @@ def calculate_energy_balance_coefficients(
     """
     # 步骤1: 计算空气密度参考值（使用ERA5气温）
     rho_ref = calculate_air_density(surface_pressure, era5_air_temperature)
-    
+
     # 获取参考气温（用于系数计算）
-    ta_reference = float(np.mean(era5_air_temperature))
-    
+    ta_reference = float(np.nanmean(era5_air_temperature))
+
     # 步骤2: 计算净辐射系数
     net_rad_calc = NetRadiationCalculator(
         shortwave_down=shortwave_down,
@@ -123,7 +123,7 @@ def calculate_energy_balance_coefficients(
         ta_reference=ta_reference
     )
     Q_star_coeffs = net_rad_calc.net_radiation_coefficient
-    
+
     # 步骤3: 计算感热通量系数
     sensible_calc = SensibleHeatFluxCalculator(
         surface_temperature=surface_temperature,
@@ -131,19 +131,19 @@ def calculate_energy_balance_coefficients(
         air_density=rho_ref
     )
     QH_coeffs = sensible_calc.sensible_heat_coefficient
-    
+
     # 步骤4: 计算储热通量（不依赖Ta）
     # 使用参考气温计算Q*₀来估算
     L_up = surface_emissivity * STEFAN_BOLTZMANN * (surface_temperature ** 4)
     epsilon_a = net_rad_calc.atmospheric_emissivity
     L_down_ref = epsilon_a * STEFAN_BOLTZMANN * (ta_reference ** 4)
-    
+
     Q_star_ref = (
         (1 - albedo) * shortwave_down +
         surface_emissivity * L_down_ref -
         L_up
     )
-    
+
     # 使用 LCZ 分类计算储热
     # - 自然表面: SEBAL 公式直接计算 ΔQ_Sg
     # - 不透水面: 返回储热特征 X_storage，系数由 ALS 回归确定
@@ -157,7 +157,7 @@ def calculate_energy_balance_coefficients(
     # 获取自然表面的储热通量和不透水面的储热特征
     Delta_Q_storage = storage_calc.storage_heat_flux  # 自然表面SEBAL，不透水面=0
     storage_feature = storage_calc.storage_feature    # 不透水面Q*，自然表面=0
-    
+
     # 步骤5: 计算潜热通量 QE（不依赖Ta）
     latent_flux_calc = LatentHeatFluxCalculator(
         saturation_vapor_pressure=saturation_vapor_pressure,
@@ -167,27 +167,27 @@ def calculate_energy_balance_coefficients(
         air_density=rho_ref
     )
     QE = latent_flux_calc.latent_heat_flux
-    
+
     # 步骤6: 组合系数和残差
     # 能量平衡方程: Q* - ΔQ_storage - QH - QE = 0
     # 展开: [Q_star_coeff×Ta + Q_star_const] - ΔQ_storage - [QH_coeff×Ta + QH_const] - QE = 0
     # 整理: [Q_star_coeff - QH_coeff]×Ta + [Q_star_const - ΔQ_storage - QH_const - QE] = 0
-    
+
     f_Ta_coeff = Q_star_coeffs['coeff'] - QH_coeffs['coeff']
     residual = Q_star_coeffs['const'] - Delta_Q_storage - QH_coeffs['const'] - QE
-    
+
     # 返回结果
     return {
         # 主要输出（用于街区回归）
         'f_Ta_coeff': f_Ta_coeff.astype(np.float32),
         'residual': residual.astype(np.float32),
         'era5_air_temperature': np.asarray(era5_air_temperature).astype(np.float32),
-        
+
         # 储热回归特征（用于 ALS 回归）
         # 在 ALS 中: f(Ta) + β·storage_feature = 0
         # storage_feature = Q* (不透水面), 0 (自然表面)
         'storage_feature': storage_feature.astype(np.float32),
-        
+
         # 分项输出（用于调试和分析）
         'Q_star_coeff': Q_star_coeffs['coeff'],
         'Q_star_const': Q_star_coeffs['const'],
@@ -206,7 +206,7 @@ def validate_energy_balance(
 ) -> None:
     """
     验证系数计算的合理性
-    
+
     参数:
         f_Ta_coeff: Ta系数栅格 (W/m²/K)
         residual: 残差栅格 (W/m²)
@@ -215,34 +215,34 @@ def validate_energy_balance(
     print("\n" + "=" * 70)
     print("能量平衡系数验证")
     print("=" * 70)
-    
+
     print("\n【Ta系数统计】 (∂f/∂Ta)")
-    print(f"  平均值: {np.mean(f_Ta_coeff):>8.3f} W/m²/K")
-    print(f"  标准差: {np.std(f_Ta_coeff):>8.3f} W/m²/K")
-    print(f"  最小值: {np.min(f_Ta_coeff):>8.3f} W/m²/K")
-    print(f"  最大值: {np.max(f_Ta_coeff):>8.3f} W/m²/K")
-    
+    print(f"  平均值: {np.nanmean(f_Ta_coeff):>8.3f} W/m²/K")
+    print(f"  标准差: {np.nanstd(f_Ta_coeff):>8.3f} W/m²/K")
+    print(f"  最小值: {np.nanmin(f_Ta_coeff):>8.3f} W/m²/K")
+    print(f"  最大值: {np.nanmax(f_Ta_coeff):>8.3f} W/m²/K")
+
     print("\n【残差统计】 (不依赖Ta的部分)")
-    print(f"  平均值: {np.mean(residual):>8.2f} W/m²")
-    print(f"  标准差: {np.std(residual):>8.2f} W/m²")
-    print(f"  最小值: {np.min(residual):>8.2f} W/m²")
-    print(f"  最大值: {np.max(residual):>8.2f} W/m²")
-    
+    print(f"  平均值: {np.nanmean(residual):>8.2f} W/m²")
+    print(f"  标准差: {np.nanstd(residual):>8.2f} W/m²")
+    print(f"  最小值: {np.nanmin(residual):>8.2f} W/m²")
+    print(f"  最大值: {np.nanmax(residual):>8.2f} W/m²")
+
     # 测试：用Ta_test计算能量平衡
     balance = f_Ta_coeff * ta_test + residual
     print(f"\n【使用Ta={ta_test:.2f}K时的能量平衡】")
-    print(f"  f(Ta) 平均: {np.mean(balance):>8.2f} W/m²")
-    print(f"  f(Ta) 标准差: {np.std(balance):>8.2f} W/m²")
+    print(f"  f(Ta) 平均: {np.nanmean(balance):>8.2f} W/m²")
+    print(f"  f(Ta) 标准差: {np.nanstd(balance):>8.2f} W/m²")
     print("  理想情况: f(Ta) 应接近 0 W/m²")
-    
+
     # 估算Ta使能量平衡为0
     Ta_estimate = -residual / f_Ta_coeff
     Ta_valid = Ta_estimate[(Ta_estimate > 273.15) & (Ta_estimate < 323.15)]
-    
+
     if len(Ta_valid) > 0:
         print("\n【估算Ta使f(Ta)=0】")
         print(f"  平均Ta: {np.mean(Ta_valid):>8.2f} K ({np.mean(Ta_valid)-273.15:>5.2f}°C)")
         print(f"  标准差: {np.std(Ta_valid):>8.2f} K")
         print(f"  范围: [{np.min(Ta_valid)-273.15:>5.2f}, {np.max(Ta_valid)-273.15:>5.2f}]°C")
-    
+
     print("=" * 70 + "\n")

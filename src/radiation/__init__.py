@@ -6,7 +6,7 @@
 核心思想:
     不需要Ta（近地表气温）的具体值，而是计算Ta的系数：
     f(Ta) = coeff_Ta × Ta + residual = 0
-    
+
     在街区聚合后，通过ALS回归求解每个街区的Ta。
 
 主要功能:
@@ -103,7 +103,7 @@ __all__ = [
     # 能量平衡系数计算（用于街区回归）
     'calculate_energy_balance_coefficients',
     'validate_energy_balance',
-    
+
     # 工作流
     'calculate_energy_balance',
 

@@ -8,8 +8,9 @@ Factors considered:
   - Atmospheric transmissivity
 """
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Optional
 import numpy as np
+from pyproj import CRS, Transformer
 
 def parse_datetime(date_str: str, time_str: str) -> datetime:
     """
@@ -64,8 +65,12 @@ class SolarConstantsCalculator:
     def solar_time_angle(self) -> float:
         """
         calculated omega = π/12 * (t - 12 - 4*(Lz - Lon)/60)
+        
+        Note: self.longitude is in radians, std_meridian is in degrees
         """
-        delta_lon = (self.std_meridian - self.longitude) / 15.0
+        # Convert longitude from radians to degrees for time calculation
+        longitude_deg = np.degrees(self.longitude)
+        delta_lon = (self.std_meridian - longitude_deg) / 15.0
         solar_time = self.hour + delta_lon
         omega = np.pi / 12 * (solar_time - 12)
         return omega
@@ -186,20 +191,31 @@ class SolarRadiationCalculator:
     @property
     def diffuse_radiation(self) -> np.ndarray:
         """
-        Calculate diffuse radiation (simplified model)
+        Calculate diffuse radiation (simplified isotropic sky model)
 
-        equation: Rd = 0.25 * Gsc * τ_sw * sin(α)
+        Diffuse radiation comes from the entire sky hemisphere, not just the sun direction.
+        It depends on:
+        - Solar elevation angle (higher sun = more scattering in atmosphere)
+        - Sky view factor (terrain slope reduces visible sky)
+
+        equation: Rd = 0.25 * Gsc * τ_sw * sin(α_sun) * SVF
+        where SVF (sky view factor) ≈ (1 + cos(slope)) / 2
 
         Returns:
             diffuse radiation array in W/m² (ndarray)
         """
-        sun_elevation = np.pi / 2 - self.incident_angle
-
-        diffuse = np.where(
-            sun_elevation > 0,
-            0.25 * self.constants.Gsc * self.atmospheric_transmissivity * np.sin(sun_elevation),
-            0.0
-        )
+        # Use solar elevation angle (not terrain incident angle)
+        sun_elevation = self.constants.sun_elevation_angle
+        
+        if sun_elevation <= 0:
+            return np.zeros_like(self.elevation, dtype=np.float32)
+        
+        # Sky view factor: fraction of sky visible from sloped surface
+        # SVF = 1 for flat surface, decreases with steeper slopes
+        sky_view_factor = (1 + np.cos(self.slope)) / 2
+        
+        # Diffuse radiation from sky
+        diffuse = 0.25 * self.constants.Gsc * self.atmospheric_transmissivity * np.sin(sun_elevation) * sky_view_factor
 
         return np.maximum(diffuse, 0.0).astype(np.float32)
 
@@ -221,14 +237,17 @@ class SolarRadiationCalculator:
 
 def calculate_dem_solar_radiation(dem_array: np.ndarray,
                                   dem_geotransform: Tuple,
+                                  slope_array: np.ndarray,
+                                  aspect_array: np.ndarray,
                                   datetime_obj: datetime,
                                   std_meridian: float = 120.0,
-                                  consider_terrain: bool = True) -> np.ndarray:
+                                  consider_terrain: bool = True,
+                                  target_crs: Optional[str] = None) -> np.ndarray:
     """
     Calculate shortwave downward radiation for entire DEM array
 
     This is a helper function that orchestrates the calculation workflow:
-    1. Calculate slope and aspect from DEM
+    1. Use provided slope and aspect arrays
     2. Create solar constants calculator (center coordinates)
     3. Create radiation calculator with arrays
     4. Return global radiation array
@@ -236,31 +255,57 @@ def calculate_dem_solar_radiation(dem_array: np.ndarray,
     Parameters:
         dem_array: elevation array in meters (ndarray)
         dem_geotransform: geotransform tuple (x_min, pixel_width, 0, y_max, 0, -pixel_height)
+        slope_array: pre-computed slope array in radians (ndarray)
+        aspect_array: pre-computed aspect array in radians (ndarray)
         datetime_obj: calculation datetime
         std_meridian: standard meridian in degrees (default 120 for China)
         consider_terrain: whether to consider slope and aspect effects
+        target_crs: coordinate reference system string (e.g., 'EPSG:32650')
+                   If provided, coordinates will be transformed to WGS84 for solar calculations
 
     Returns:
         global radiation array in W/m² (ndarray)
     """
     rows, cols = dem_array.shape
 
-    # Extract coordinates
+    # Extract coordinates (in source CRS units)
     x_min = dem_geotransform[0]
     pixel_width = dem_geotransform[1]
     y_max = dem_geotransform[3]
     pixel_height = dem_geotransform[5]  # Usually negative
 
-    # Calculate slope and aspect if needed
+    # Calculate center coordinates in source CRS
+    center_x = x_min + pixel_width * cols / 2
+    center_y = y_max + pixel_height * rows / 2
+
+    # Transform coordinates to WGS84 (EPSG:4326) if a projected CRS is provided
+    if target_crs is not None:
+        src_crs = CRS.from_string(target_crs)
+        # Check if the CRS is projected (not geographic)
+        if src_crs.is_projected:
+            # Transform to WGS84
+            transformer = Transformer.from_crs(src_crs, CRS.from_epsg(4326), always_xy=True)
+            center_lon_deg, center_lat_deg = transformer.transform(center_x, center_y)
+        else:
+            # Already in geographic coordinates
+            center_lon_deg = center_x
+            center_lat_deg = center_y
+    else:
+        # Assume coordinates are already in degrees (legacy behavior)
+        center_lon_deg = center_x
+        center_lat_deg = center_y
+    
+    # Convert to radians for trigonometric calculations
+    center_lat = np.radians(center_lat_deg)
+    center_lon = np.radians(center_lon_deg)
+
+    # Determine slope and aspect arrays
     if consider_terrain:
-        slopes, aspects = calculate_slope_aspect(dem_array, pixel_width, abs(pixel_height))
+        slopes = slope_array.astype(np.float32)
+        aspects = aspect_array.astype(np.float32)
     else:
         slopes = np.zeros_like(dem_array, dtype=np.float32)
         aspects = np.zeros_like(dem_array, dtype=np.float32)
-
-    # Use center coordinates for sun position
-    center_lat = np.radians(y_max + pixel_height * rows / 2)
-    center_lon = np.radians(x_min + pixel_width * cols / 2)
 
     # Create solar constants calculator
     solar_constants = SolarConstantsCalculator(

@@ -6,7 +6,7 @@
 核心思想:
     不需要Ta的具体值，只计算Ta的系数：
     Q* = Q*_coeff × Ta + Q*_const
-    
+
     其中:
     - Q*_coeff = ε₀ × ∂L↓/∂Ta = ε₀ × 4εₐσTa₀³
     - Q*_const = (1-α)S↓ + ε₀×L↓_const - L↑
@@ -27,10 +27,10 @@ from .constants import STEFAN_BOLTZMANN
 class NetRadiationCalculator:
     """
     净辐射系数计算器
-    
+
     计算净辐射关于Ta的系数和常数项，用于街区回归。
     不需要Ta的具体值。
-    
+
     公式: Q* = Q*_coeff × Ta + Q*_const
     """
 
@@ -45,7 +45,7 @@ class NetRadiationCalculator:
     ):
         """
         初始化净辐射系数计算器
-        
+
         参数:
             shortwave_down: 短波下行辐射 S↓ (W/m²) - ndarray
             surface_temperature: 地表温度 Ts (K) - ndarray
@@ -65,9 +65,9 @@ class NetRadiationCalculator:
     def atmospheric_transmissivity(self) -> np.ndarray:
         """
         计算大气透射率（高程修正）
-        
+
         公式: τ_sw = 0.75 + 2×10⁻⁵ × Ele
-        
+
         返回:
             大气透射率 τ_sw (0.1-1.0) - ndarray
         """
@@ -78,9 +78,9 @@ class NetRadiationCalculator:
     def atmospheric_emissivity(self) -> np.ndarray:
         """
         计算大气发射率
-        
+
         公式: εₐ = 0.85 × (-ln τ_sw)^0.09
-        
+
         返回:
             大气发射率 εₐ (0-1) - ndarray
         """
@@ -94,9 +94,9 @@ class NetRadiationCalculator:
     def longwave_up(self) -> np.ndarray:
         """
         计算长波上行辐射（不依赖Ta）
-        
+
         公式: L↑ = ε₀σTs⁴
-        
+
         返回:
             长波上行辐射 (W/m²) - ndarray
         """
@@ -106,10 +106,10 @@ class NetRadiationCalculator:
     def longwave_down_coefficient(self) -> Dict[str, np.ndarray]:
         """
         计算长波下行辐射的系数和常数项
-        
+
         L↓ = εₐσTa⁴
         线性化: L↓ ≈ 4εₐσTa₀³ × Ta + const
-        
+
         返回:
             {
                 'coeff': ∂L↓/∂Ta 在Ta₀处 (W/m²/K),
@@ -117,13 +117,13 @@ class NetRadiationCalculator:
             }
         """
         epsilon_a = self.atmospheric_emissivity
-        
+
         # ∂L↓/∂Ta = 4εₐσTa³
         coeff = 4 * epsilon_a * STEFAN_BOLTZMANN * (self.Ta0 ** 3)
-        
+
         # 常数项 = L↓(Ta₀) - coeff × Ta₀ = -3εₐσTa₀⁴
         const = -3 * epsilon_a * STEFAN_BOLTZMANN * (self.Ta0 ** 4)
-        
+
         return {
             'coeff': coeff.astype(np.float32),
             'const': const.astype(np.float32)
@@ -133,11 +133,11 @@ class NetRadiationCalculator:
     def net_radiation_coefficient(self) -> Dict[str, np.ndarray]:
         """
         计算净辐射的系数和常数项
-        
+
         Q* = (1-α)S↓ + ε₀L↓ - L↑
            = (1-α)S↓ + ε₀[coeff_L×Ta + const_L] - L↑
            = [ε₀×coeff_L]×Ta + [(1-α)S↓ + ε₀×const_L - L↑]
-        
+
         返回:
             {
                 'coeff': ∂Q*/∂Ta (W/m²/K),
@@ -146,17 +146,17 @@ class NetRadiationCalculator:
         """
         L_down = self.longwave_down_coefficient
         L_up = self.longwave_up
-        
+
         # Q*的Ta系数 = ε₀ × ∂L↓/∂Ta
         Q_star_coeff = self.epsilon_0 * L_down['coeff']
-        
+
         # Q*的常数项 = (1-α)S↓ + ε₀×L↓_const - L↑
         Q_star_const = (
             (1 - self.albedo) * self.S_down +
             self.epsilon_0 * L_down['const'] -
             L_up
         )
-        
+
         return {
             'coeff': Q_star_coeff.astype(np.float32),
             'const': Q_star_const.astype(np.float32)

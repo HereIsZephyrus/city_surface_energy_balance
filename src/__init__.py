@@ -23,19 +23,19 @@ City Surface Energy Balance
     >>> from src.radiation import calculate_energy_balance_coefficients
     >>> from src.regression import DistrictAggregator, DistrictRegressionModel
     >>> from src.utils import RasterCollection
-    
+
     >>> # Step 1: 加载数据
     >>> collection = RasterCollection()
     >>> collection.add_raster('LST', 'landsat_lst.tif')
     >>> # ... 加载其他数据
-    
+
     >>> # Step 2: 计算能量平衡系数（栅格）
     >>> coeffs = calculate_energy_balance_coefficients(...)
-    
+
     >>> # Step 3: 聚合到街区
     >>> aggregator = DistrictAggregator()
     >>> aggregated = aggregator.aggregate_rasters_to_districts(...)
-    
+
     >>> # Step 4: 回归求解（每个街区一个Ta）
     >>> model = DistrictRegressionModel()
     >>> results = model.fit_als_regression(...)
@@ -76,14 +76,14 @@ __all__ = [
     # 版本信息
     '__version__',
     '__author__',
-    
+
     # 模块
     'radiation',
     'aerodynamics',
     'regression',
     'utils',
     'landscape',
-    
+
     # 核心函数（便捷访问）
     'calculate_energy_balance_coefficients',
     'validate_energy_balance',

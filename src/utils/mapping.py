@@ -48,12 +48,12 @@ LANDSAT_BANDS: Dict[str, int] = {
 class LCZ:
     """
     Local Climate Zone 类型编码
-    
+
     城市建筑类型 (1-9):
         1: 密集高层    2: 密集中层    3: 密集低层
         4: 开阔高层    5: 开阔中层    6: 开阔低层
         7: 轻质低层    8: 大型低层    9: 稀疏建筑
-    
+
     自然/地表类型 (10-14):
         10: 裸岩/铺装 (E)
         11: 密集树木 (A)
@@ -71,7 +71,7 @@ class LCZ:
     LIGHTWEIGHT_LOW = 7   # 轻质低层
     LARGE_LOW = 8         # 大型低层
     SPARSELY_BUILT = 9    # 稀疏建筑
-    
+
     # 自然/地表类型
     BARE_ROCK = 10        # 裸岩/铺装 (原LCZ E)
     DENSE_TREES = 11      # 密集树木 (原LCZ A)
@@ -184,7 +184,7 @@ def is_natural(lcz_value: int) -> bool:
 def needs_storage_regression(lcz_value: int) -> bool:
     """
     判断LCZ类型是否需要在 ALS 回归中估计储热系数
-    
+
     不透水面: True (储热系数 β 由回归确定)
     自然表面: False (使用 SEBAL 公式直接计算)
     """
@@ -194,7 +194,58 @@ def needs_storage_regression(lcz_value: int) -> bool:
 def use_sebal_formula(lcz_value: int) -> bool:
     """
     判断是否应使用SEBAL公式计算土壤热通量
-    
+
     自然表面使用SEBAL公式，不透水面的储热由回归确定。
     """
     return not needs_storage_regression(lcz_value)
+
+
+# ============================================================================
+# ALS 回归线性特征定义
+# ============================================================================
+#
+# 能量平衡方程:
+#   Q* + Q_F = Q_H + Q_E + ΔQ_Sb + ΔQ_Sg + ΔQ_A
+#
+# 整理为 ALS 回归形式:
+#   f(Ta) + Σαi·X_Fi + Σβi·X_Si + γ·X_A = 0
+#
+# 其中:
+#   f(Ta) = coeff_Ta × Ta + residual  (能量平衡的 Ta 相关项)
+#   X_Fi: 人为热 Q_F 相关特征
+#   X_Si: 建筑储热 ΔQ_Sb 相关特征
+#   X_A:  水平交换 ΔQ_A 相关特征
+#
+# ============================================================================
+
+# 人为热 Q_F 相关特征 (需要从街区属性获取)
+# Q_F 受到 LCZ类型、不透水面面积、人口 的影响
+ANTHROPOGENIC_HEAT_FEATURES = [
+    'population',           # 人口数量
+    'building_volume',      # 建筑总体积 (m³)
+    'lcz_type',            # LCZ 类型 (分类变量，需 one-hot 编码)
+]
+
+# 建筑储热 ΔQ_Sb 相关特征
+# ΔQ_Sb 受到 建筑体积、LCZ类型(遮蔽)、植被覆盖度 的影响
+# 注意: storage_feature (= Q* for 不透水面) 由能量平衡模块自动计算
+STORAGE_HEAT_FEATURES = [
+    'storage_feature',      # Q* (不透水面), 0 (自然表面) - 由模块计算
+    'building_volume',      # 建筑总体积 (m³)
+    'fvc',                  # 植被覆盖度
+]
+
+# 水平交换 ΔQ_A 相关特征
+# ΔQ_A 代表与相邻 LCZ 的热量交换，在 ALS 中作为待估计的线性项
+# 特征值 = 1 (常数项)，系数 γ 由回归确定
+# 或者使用邻域温度差等更复杂的特征
+HORIZONTAL_EXCHANGE_FEATURES = [
+    'neighbor_temp_diff',   # 与相邻街区的温度差 (需要空间计算)
+]
+
+# 完整的 ALS 回归特征列表
+ALS_FEATURE_GROUPS = {
+    'anthropogenic': ANTHROPOGENIC_HEAT_FEATURES,  # α 系数
+    'storage': STORAGE_HEAT_FEATURES,              # β 系数
+    'horizontal': HORIZONTAL_EXCHANGE_FEATURES,    # γ 系数
+}
