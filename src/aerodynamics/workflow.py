@@ -130,9 +130,9 @@ def calculate_aerodynamic_parameters(
             target_bounds=collection.target_bounds
         )
     
-    # 复制地理信息
+    # 复制地理信息（使用深拷贝避免引用问题）
     output._reference_bounds = collection._reference_bounds
-    output._reference_info = collection._reference_info
+    output._reference_info = collection._reference_info.copy() if collection._reference_info else None
     output._is_georeferenced = collection._is_georeferenced
     output.original_resolutions = collection.original_resolutions.copy()
     
@@ -149,6 +149,24 @@ def calculate_aerodynamic_parameters(
     
     # DEM 特殊处理
     dem[dem == -999] = np.nan
+    
+    # 创建参考栅格的有效数据掩膜（基于 NDVI）
+    # 只有 NDVI 有效的区域才进行计算
+    reference_valid_mask = np.isfinite(ndvi)
+    
+    # 将 LCZ 无效值（<1 或 >14）设为 NaN
+    # 这样这些区域的 rah 会保持 NaN
+    lcz_float = lcz.astype(np.float32)
+    invalid_lcz_mask = (lcz < 1) | (lcz > 14) | ~reference_valid_mask
+    lcz_float[invalid_lcz_mask] = np.nan
+    lcz = lcz_float
+    
+    if verbose:
+        valid_count = np.sum(reference_valid_mask)
+        invalid_lcz_count = np.sum(invalid_lcz_mask)
+        print(f"\n有效数据区域:")
+        print(f"  参考栅格有效像素: {valid_count:,d} ({valid_count/ndvi.size*100:.1f}%)")
+        print(f"  LCZ 无效像素: {invalid_lcz_count:,d} ({invalid_lcz_count/lcz.size*100:.1f}%)")
 
     if verbose:
         print("\n" + "=" * 60)
@@ -202,6 +220,18 @@ def calculate_aerodynamic_parameters(
     else:
         roughness = lcz_roughness
     
+    # 释放不再需要的原始数据以节约内存
+    del surface_pressure
+    del temperature_2m
+    del dewpoint_2m
+    del u_wind
+    del v_wind
+    del dem
+    
+    # 将已计算完成且不再需要的结果添加到集合并释放
+    output.add_array('pressure', pressure)
+    del pressure
+    
     # 位移高度 - 合并建筑数据
     displacement_height = None
     if 'displacement_height' in collection.rasters:
@@ -214,12 +244,6 @@ def calculate_aerodynamic_parameters(
             if verbose:
                 print(f"  建筑位移高度像元: {np.sum(valid_disp_mask)}")
     
-    del surface_pressure
-    del temperature_2m
-    del dewpoint_2m
-    del u_wind
-    del v_wind
-    del dem
     # 6. 阻抗
     if verbose:
         print("计算阻抗参数...")
@@ -232,13 +256,12 @@ def calculate_aerodynamic_parameters(
     rs = calculate_surface_resistance(ndvi=ndvi)
 
 
-    # 保存前先将 surface_pressure 等原始数据释放以节约内存
+    # 释放阻抗计算中使用的临时数据
     del ndvi
     del lcz
     del displacement_height
 
-    # 将计算结果添加到输出集合
-    output.add_array('pressure', pressure)
+    # 将剩余计算结果添加到输出集合
     output.add_array('air_density', air_density)
     output.add_array('wind_speed', wind_speed)
     output.add_array('actual_vapor_pressure', ea)

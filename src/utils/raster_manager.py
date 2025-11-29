@@ -22,13 +22,11 @@
 import numpy as np
 import xarray as xr
 from rasterio.enums import Resampling
-from rasterio.features import rasterize
 from pathlib import Path
 from typing import Union, Dict, List, Optional, Tuple
 import warnings
 import rasterio
 import rioxarray as rxr
-import geopandas as gpd
 from rasterio.transform import Affine
 
 class RasterBand:
@@ -364,8 +362,8 @@ class RasterCollection:
         # 检查地理参考是否已初始化
         if not self._is_georeferenced:
             raise RuntimeError(
-                f"地理参考未初始化！在使用 RasterCollection 前必须先调用 set_reference() 方法。"
-                f"\n请使用 collection.set_reference(reference_image) 设置参考图像。"
+                "地理参考未初始化！在使用 RasterCollection 前必须先调用 set_reference() 方法。"
+                "\n请使用 collection.set_reference(reference_image) 设置参考图像。"
             )
 
         da.name = name
@@ -391,53 +389,50 @@ class RasterCollection:
                 # 更新原始分辨率（坐标系转换后）
                 self.original_resolutions[name] = abs(da.rio.resolution()[0])
 
-        # 强制分辨率重采样到目标分辨率
-        already_aligned = False  # 标记是否已经对齐到目标网格
-        if self.target_resolution is not None:
-            # 计算当前分辨率
+        # 强制对齐到目标网格（无论分辨率是否匹配都需要对齐）
+        if self.target_resolution is not None and self._reference_bounds is not None and self._reference_info is not None:
             if hasattr(da, 'rio'):
                 current_res = abs(da.rio.resolution()[0])  # 假设正方形像素
-                if abs(current_res - self.target_resolution) > 1e-6:  # 允许小误差
+                needs_resample = abs(current_res - self.target_resolution) > 1e-6
+                
+                if needs_resample:
                     print(f"  重采样 {name}: {current_res:.1f}m → {self.target_resolution:.1f}m")
-                    # 使用参考范围的网格进行重采样
-                    if self._reference_bounds is not None and self._reference_info is not None:
-                        # 使用 reference_info 中的尺寸，确保与 set_reference 计算一致
-                        bounds = self._reference_bounds
-                        ref_width = self._reference_info['width']
-                        ref_height = self._reference_info['height']
-                        res = self.target_resolution
-                        
-                        # 生成像素中心坐标（从左上角开始）
-                        # x: 从 left + res/2 开始，共 width 个点
-                        # y: 从 top - res/2 开始，共 height 个点（向下递减）
-                        target_x = np.linspace(
-                            bounds[0] + res / 2,
-                            bounds[0] + res / 2 + (ref_width - 1) * res,
-                            ref_width
-                        )
-                        target_y = np.linspace(
-                            bounds[3] - res / 2,
-                            bounds[3] - res / 2 - (ref_height - 1) * res,
-                            ref_height
-                        )
-
-                        # 保存 CRS 信息（interp 会丢失 rio 属性）
-                        original_crs = da.rio.crs
-                        da = da.interp(x=target_x, y=target_y, method='linear')
-                        da.name = name
-                        # 重新写入 CRS 信息
-                        da = da.rio.write_crs(original_crs)
-                        # interp 已经将数据插值到目标网格，不需要再裁剪
-                        already_aligned = True
-
-        # 裁剪到参考范围（仅对未经 interp 处理的数据）
-        if not already_aligned and self._reference_bounds is not None and hasattr(da, 'rio'):
-            bounds = self._reference_bounds
-            da = da.rio.clip_box(
-                minx=bounds[0], miny=bounds[1],
-                maxx=bounds[2], maxy=bounds[3]
-            )
-            da.name = name
+                else:
+                    print(f"  对齐 {name} 到目标网格")
+                
+                # 使用 rio.reproject 进行重采样，确保正确处理边缘插值
+                # 这比 interp 更可靠，特别是对于低分辨率数据（如 ERA5）
+                ref_info = self._reference_info
+                resampling_map = {
+                    'bilinear': Resampling.bilinear,
+                    'nearest': Resampling.nearest,
+                    'cubic': Resampling.cubic
+                }
+                resampling_method = resampling_map.get(resampling, Resampling.bilinear)
+                
+                # 使用 reproject 重采样到目标网格
+                da = da.rio.reproject(
+                    dst_crs=self.target_crs,
+                    shape=(ref_info['height'], ref_info['width']),
+                    transform=ref_info['transform'],
+                    resampling=resampling_method
+                )
+                da.name = name
+                
+                # 对于低分辨率数据（如 ERA5），边缘可能仍有 NaN 值
+                # 使用该要素的均值填充这些缺失值
+                if needs_resample and current_res > self.target_resolution * 10:
+                    # 只对分辨率差异大于10倍的数据进行填充（如 ERA5 ~11km vs Landsat 10m）
+                    arr = da.values
+                    nan_mask = np.isnan(arr)
+                    nan_count = np.sum(nan_mask)
+                    if nan_count > 0:
+                        mean_val = np.nanmean(arr)
+                        if np.isfinite(mean_val):
+                            arr[nan_mask] = mean_val
+                            da = da.copy(data=arr)
+                            da.name = name
+                            print(f"    填充 {nan_count} 个边缘 NaN 值 (使用均值 {mean_val:.4f})")
 
         # 确保存储的是 2D 数据（压缩 band 维度）
         if da.ndim == 3 and da.shape[0] == 1:
@@ -542,95 +537,6 @@ class RasterCollection:
         for name, band in bands.items():
             full_name = f"{prefix}_{name}" if prefix else name
             self.add_raster(full_name, filepath, band=band, resampling=resampling)
-
-    def add_vector_raster(
-        self,
-        name: str,
-        vector_path: Union[str, Path],
-        attribute: str,
-        default_value: float = 0,
-        dtype: type = np.float32
-    ) -> None:
-        """
-        将矢量数据栅格化并添加到集合
-
-        矢量数据会自动：
-        1. 转换到目标坐标系 (target_crs)
-        2. 栅格化到与参考图像完全一致的网格（分辨率、范围、像素对齐）
-
-        参数:
-            name: 栅格名称（用于后续访问）
-            vector_path: 矢量文件路径（GeoPackage .gpkg）
-            attribute: 用于栅格化的属性字段名（如 'LCZ'）
-            default_value: 无数据区域的默认值（默认0）
-            dtype: 输出数据类型（默认 np.float32）
-
-        示例:
-            collection.add_vector_raster(
-                name='lcz',
-                vector_path='lcz.gpkg',
-                attribute='LCZ'
-            )
-        """
-        if not self._is_georeferenced:
-            raise RuntimeError(
-                "地理参考未初始化！必须先调用 set_reference() 方法。"
-            )
-
-        vector_path = Path(vector_path)
-        if not vector_path.exists():
-            raise FileNotFoundError(f"矢量文件不存在: {vector_path}")
-
-        # 读取矢量数据
-        gdf = gpd.read_file(vector_path)
-        print(f"  读取矢量: {vector_path.name} ({len(gdf)} 个要素)")
-
-        # 转换到目标坐标系
-        if gdf.crs is not None and str(gdf.crs) != str(self.target_crs):
-            print(f"  坐标转换: {gdf.crs} → {self.target_crs}")
-            gdf = gdf.to_crs(self.target_crs)
-
-        # 获取参考信息
-        ref_info = self.get_reference_info()
-
-        # 构建 (geometry, value) 对
-        shapes = [
-            (geom, value) 
-            for geom, value in zip(gdf.geometry, gdf[attribute])
-            if geom is not None and not geom.is_empty
-        ]
-
-        if not shapes:
-            raise ValueError(f"矢量文件中没有有效的几何体或属性 '{attribute}'")
-
-        # 栅格化
-        raster_array = rasterize(
-            shapes=shapes,
-            out_shape=(ref_info['height'], ref_info['width']),
-            transform=ref_info['transform'],
-            fill=default_value,
-            dtype=dtype
-        )
-
-        # 转换为 DataArray 并添加空间参考
-        # 计算坐标
-        transform = ref_info['transform']
-        x_coords = np.arange(ref_info['width']) * transform.a + transform.c + transform.a / 2
-        y_coords = np.arange(ref_info['height']) * transform.e + transform.f + transform.e / 2
-
-        da = xr.DataArray(
-            raster_array,
-            dims=['y', 'x'],
-            coords={'y': y_coords, 'x': x_coords},
-            name=name
-        )
-        da = da.rio.write_crs(ref_info['crs'])
-        da = da.rio.write_transform(ref_info['transform'])
-
-        self.rasters[name] = da
-        # 矢量数据栅格化后，原始分辨率等于目标分辨率
-        self.original_resolutions[name] = self.target_resolution
-        print(f"✓ 矢量栅格化: {name} (属性: {attribute}, 形状: {raster_array.shape})")
 
     def get_raster(self, name: str) -> RasterBand:
         """获取栅格数据"""
@@ -800,6 +706,8 @@ class RasterCollection:
         # 获取参考地理信息
         ref_info = self.get_reference_info()
 
+        expected_shape = (ref_info['height'], ref_info['width'])
+
         with rasterio.open(
             output_path, 'w',
             driver='GTiff',
@@ -816,6 +724,14 @@ class RasterCollection:
                 # 确保是2D数组
                 if arr.ndim == 3:
                     arr = arr[0, :, :]
+                
+                # 尺寸检查
+                if arr.shape != expected_shape:
+                    raise ValueError(
+                        f"波段 '{name}' 尺寸不匹配！"
+                        f"期望 {expected_shape}，实际 {arr.shape}"
+                    )
+                
                 dst.write(arr.astype(dtype), i)
                 dst.set_band_description(i, name)
 
@@ -866,6 +782,15 @@ class RasterCollection:
             raise RuntimeError("地理参考未初始化！必须先调用 set_reference() 方法。")
         
         ref_info = self.get_reference_info()
+        expected_shape = (ref_info['height'], ref_info['width'])
+        
+        # 尺寸检查
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"数组 '{name}' 尺寸不匹配！"
+                f"期望 {expected_shape}，实际 {array.shape}"
+            )
+        
         transform = ref_info['transform']
         x_coords = np.arange(ref_info['width']) * transform.a + transform.c + transform.a / 2
         y_coords = np.arange(ref_info['height']) * transform.e + transform.f + transform.e / 2

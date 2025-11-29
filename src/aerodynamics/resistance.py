@@ -92,8 +92,12 @@ def calculate_aerodynamic_resistance(
     kappa = 0.41  # Von Karman常数
     a = 6.266     # 边界层阻抗系数（城市不透水面）
 
+    # 处理 LCZ 中的 NaN 值
+    # 将 NaN 替换为 0（后续 mask 不会匹配，保持 rah = NaN）
+    lcz_safe = np.where(np.isfinite(lcz), lcz, 0).astype(int)
+    
     # 根据LCZ获取Obukhov长度
-    obukhov_length = get_obukhov_length_from_lcz(lcz)
+    obukhov_length = get_obukhov_length_from_lcz(lcz_safe)
 
     # 根据地表类型设置位移高度
     # 基于 LCZ 的默认估算:
@@ -103,10 +107,10 @@ def calculate_aerodynamic_resistance(
     #   裸土 (LCZ 13): d ≈ 0
     #   水体 (LCZ 14): d = 0
     lcz_displacement = np.where(
-        lcz <= 9,
+        lcz_safe <= 9,
         6.5 * roughness_length,   # 城市建筑
         np.where(
-            (lcz == _LCZ_DENSE_TREES) | (lcz == _LCZ_BUSH_GRASS),
+            (lcz_safe == _LCZ_DENSE_TREES) | (lcz_safe == _LCZ_BUSH_GRASS),
             0.67 * roughness_length,  # 植被
             0.0  # 铺装、裸土、水体
         )
@@ -150,12 +154,12 @@ def calculate_aerodynamic_resistance(
     phi_m = (1 - 16 * zeta) ** (-0.25)
     phi_v = phi_m ** 2
 
-    # 初始化结果数组
-    rah = np.zeros_like(wind_speed, dtype=np.float32)
+    # 初始化结果数组为 NaN（无效区域保持 NaN）
+    rah = np.full_like(wind_speed, np.nan, dtype=np.float32)
 
     # === 情况1: 城市/不透水面 (LCZ 1-10) - unsaturated 公式 ===
     # rah = (Φv/Φm) × (uz/u*²) + a × u*^(-2/3)
-    urban_mask = (lcz >= 1) & (lcz <= _LCZ_BARE_ROCK)
+    urban_mask = (lcz_safe >= 1) & (lcz_safe <= _LCZ_BARE_ROCK)
     r_am = wind_speed_safe / (u_star_safe ** 2)   # 动力阻抗 r_am = uz / u*²
     r_b = a * (u_star_safe ** (-2/3))              # 边界层阻抗 r_b = a × u*^(-2/3)
     rah_urban = (phi_v / phi_m) * r_am + r_b       # Φv/Φm = Φm
@@ -164,25 +168,27 @@ def calculate_aerodynamic_resistance(
     # === 情况2: 植被/饱和面 (LCZ 11-12) - saturated 公式 ===
     # rah = ln((z - d) / z0) / (k² × Uw)
     # 注：文档原式为 ln((Z_tree - d) × Z_ρ)，此处简化为 ln((z-d)/z0)
-    veg_mask = (lcz == _LCZ_DENSE_TREES) | (lcz == _LCZ_BUSH_GRASS)
+    veg_mask = (lcz_safe == _LCZ_DENSE_TREES) | (lcz_safe == _LCZ_BUSH_GRASS)
     rah_veg = np.log(z_effective_safe / z0_safe) / (kappa ** 2 * wind_speed_safe)
     rah[veg_mask] = rah_veg[veg_mask]
 
     # === 情况3: 裸土/沙地 (LCZ 13) ===
     # 使用与植被相似的 saturated 公式，但无位移高度
-    bare_soil_mask = (lcz == _LCZ_BARE_SOIL)
+    bare_soil_mask = (lcz_safe == _LCZ_BARE_SOIL)
     rah_soil = np.log(measurement_height / z0_safe) / (kappa ** 2 * wind_speed_safe)
     rah[bare_soil_mask] = rah_soil[bare_soil_mask]
 
     # === 情况4: 水体 (LCZ 14) - 特殊处理 ===
     # 水面粗糙度极小（~0.0001m），使用固定粗糙度
-    water_mask = (lcz == _LCZ_WATER)
+    water_mask = (lcz_safe == _LCZ_WATER)
     z0_water = 0.0001  # 静水面粗糙度
     rah_water = np.log(measurement_height / z0_water) / (kappa ** 2 * wind_speed_safe)
     rah[water_mask] = rah_water[water_mask]
 
     # 限制在合理范围 (通常 10-500 s/m)
-    rah = np.clip(rah, 10.0, 500.0)
+    # 注意：保持 NaN 值不变（无效 LCZ 区域）
+    valid_mask = np.isfinite(rah)
+    rah[valid_mask] = np.clip(rah[valid_mask], 10.0, 500.0)
 
     return rah.astype(np.float32)
 

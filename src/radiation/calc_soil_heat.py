@@ -2,29 +2,41 @@
 地面/建筑储热通量计算模块
 
 根据 LCZ 类型分类计算储热:
-- 自然表面: 使用 SEBAL 公式直接计算土壤热通量 (ΔQ_Sg)
-- 不透水面: 返回储热特征 X_storage = Q*，系数 β 在 ALS 回归中估计
+- 自然表面 (LCZ 11-14): 使用 SEBAL 公式直接计算土壤热通量 (ΔQ_Sg)
+- 不透水面 (LCZ 1-10): 使用基础储热系数 + 建筑额外贡献
 
-在 ALS 回归框架中:
-    f(Ta) + β·X_storage = 0
+储热计算分解:
+    ΔQ_storage = ΔQ_impervious + ΔQ_building
 
     其中:
-    - X_storage = Q* (对于不透水面)
-    - X_storage = 0 (对于自然表面，已用 SEBAL 计算)
-    - β 是待估计的储热系数
+    - ΔQ_impervious = β_impervious × Q*  (不透水面基础储热，β ≈ 0.35)
+    - ΔQ_building: 建筑额外储热贡献，通过 ALS 回归估计
+
+在 ALS 回归框架中:
+    f(Ta) + β_building·X_building = 0
+
+    其中:
+    - X_building = Q* (对于建筑区 LCZ 1-9)
+    - X_building = 0 (对于其他区域)
+    - β_building 是待估计的建筑储热系数
 
 公式:
     自然表面 SEBAL: ΔQ_Sg/Q* = (Ts - 273.15)/α × (0.0038α + 0.0074α²) × (1 - 0.98NDVI⁴)
+    不透水面基础: ΔQ_impervious = 0.35 × Q*
 
 参考:
     - SEBAL (Bastiaanssen et al., 1998)
+    - Grimmond & Oke (1999): Heat storage in urban areas
     - 晴朗无风条件下城市生态空间对城市降温作用量化模型
 """
 
 import numpy as np
 from typing import Tuple
 
-from ..utils import LCZ_NEEDS_STORAGE_REGRESSION
+from ..utils import LCZ_NEEDS_STORAGE_REGRESSION, URBAN_LCZ_TYPES
+
+# 不透水面基础储热系数（典型值 0.30-0.40）
+IMPERVIOUS_STORAGE_COEFFICIENT = 0.35
 
 
 class StorageHeatFluxCalculator:
@@ -32,8 +44,9 @@ class StorageHeatFluxCalculator:
     地面/建筑储热通量计算器
 
     根据 LCZ 类型自动选择计算方法:
-    - 自然表面: SEBAL 公式直接计算 ΔQ_Sg
-    - 不透水面: 返回储热特征 X_storage，系数由 ALS 回归确定
+    - 自然表面 (LCZ 11-14): SEBAL 公式直接计算 ΔQ_Sg
+    - 不透水面 (LCZ 1-10): 基础储热系数 × Q*
+    - 建筑区 (LCZ 1-9): 额外返回建筑特征用于 ALS 回归
     """
 
     def __init__(
@@ -42,7 +55,8 @@ class StorageHeatFluxCalculator:
         surface_temperature: np.ndarray,
         albedo: np.ndarray,
         ndvi: np.ndarray,
-        lcz: np.ndarray
+        lcz: np.ndarray,
+        impervious_coefficient: float = IMPERVIOUS_STORAGE_COEFFICIENT
     ):
         """
         初始化储热通量计算器
@@ -53,12 +67,14 @@ class StorageHeatFluxCalculator:
             albedo: 地表反照率 α (0-1)
             ndvi: 归一化植被指数 (-1 to 1)
             lcz: LCZ分类栅格 (1-14)
+            impervious_coefficient: 不透水面基础储热系数 (默认 0.35)
         """
         self.Q_star = net_radiation
         self.Ts = surface_temperature
         self.albedo = albedo
         self.ndvi = ndvi
         self.lcz = lcz.astype(int)
+        self.beta_impervious = impervious_coefficient
 
     def _calculate_sebal_flux(self) -> np.ndarray:
         """
@@ -76,57 +92,100 @@ class StorageHeatFluxCalculator:
         delta_Q = self.Q_star * ratio
         return np.clip(delta_Q, 0, 0.5 * np.abs(self.Q_star))
 
-    def _get_regression_mask(self) -> np.ndarray:
+    def _get_impervious_mask(self) -> np.ndarray:
         """
-        获取需要储热回归的像素掩码
+        获取不透水面的像素掩码 (LCZ 1-10)
 
         返回:
-            bool数组: True = 不透水面（需要回归），False = 自然表面（用SEBAL）
+            bool数组: True = 不透水面，False = 自然表面
         """
-        regression_mask = np.zeros_like(self.lcz, dtype=bool)
+        impervious_mask = np.zeros_like(self.lcz, dtype=bool)
         for lcz_val, needs_regression in LCZ_NEEDS_STORAGE_REGRESSION.items():
             if needs_regression:
-                regression_mask |= (self.lcz == lcz_val)
-        return regression_mask
+                impervious_mask |= (self.lcz == lcz_val)
+        return impervious_mask
+
+    def _get_building_mask(self) -> np.ndarray:
+        """
+        获取建筑区的像素掩码 (LCZ 1-9)
+
+        返回:
+            bool数组: True = 建筑区，False = 非建筑区
+        """
+        building_mask = np.zeros_like(self.lcz, dtype=bool)
+        for lcz_val in URBAN_LCZ_TYPES:
+            building_mask |= (self.lcz == lcz_val)
+        return building_mask
 
     @property
     def storage_heat_flux(self) -> np.ndarray:
         """
-        计算自然表面的储热通量（SEBAL）
+        计算储热通量
 
-        注意: 不透水面的储热在此设为 0，其储热系数将在 ALS 回归中估计
+        分类处理:
+        - 自然表面 (LCZ 11-14): SEBAL 公式
+        - 不透水面 (LCZ 1-10): β_impervious × Q*
 
         返回:
-            储热通量 (W/m²) - 自然表面为 ΔQ_Sg，不透水面为 0
+            储热通量 (W/m²)
         """
+        # 计算 SEBAL 通量（用于自然表面）
         sebal_flux = self._calculate_sebal_flux()
-        regression_mask = self._get_regression_mask()
-        result = np.where(regression_mask, 0.0, sebal_flux)
+
+        # 计算不透水面基础储热
+        impervious_flux = self.beta_impervious * self.Q_star
+
+        # 获取掩码
+        impervious_mask = self._get_impervious_mask()
+
+        # 合并：不透水面使用固定系数，自然表面使用 SEBAL
+        result = np.where(impervious_mask, impervious_flux, sebal_flux)
+
+        # 限制在合理范围
+        result = np.clip(result, 0, 0.5 * np.abs(self.Q_star))
+
         return result.astype(np.float32)
 
     @property
     def storage_feature(self) -> np.ndarray:
         """
-        获取储热回归特征 X_storage
+        获取建筑储热回归特征 X_building
 
-        用于 ALS 回归: f(Ta) + β·X_storage = 0
+        用于 ALS 回归估计建筑额外储热贡献:
+            f(Ta) + β_building·X_building = 0
 
         返回:
-            储热特征 (W/m²):
-            - 不透水面: Q* (作为回归特征)
-            - 自然表面: 0 (不参与储热回归)
+            建筑储热特征 (W/m²):
+            - 建筑区 (LCZ 1-9): Q* (作为回归特征)
+            - 其他区域: 0 (不参与建筑储热回归)
+
+        注意:
+            不透水面的基础储热已在 storage_heat_flux 中计算，
+            此特征仅用于估计建筑的额外贡献。
         """
-        regression_mask = self._get_regression_mask()
-        feature = np.where(regression_mask, self.Q_star, 0.0)
+        building_mask = self._get_building_mask()
+        feature = np.where(building_mask, self.Q_star, 0.0)
         return feature.astype(np.float32)
 
     def get_flux_and_feature(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        同时返回储热通量和回归特征
+        同时返回储热通量和建筑回归特征
 
         返回:
-            (storage_flux, storage_feature):
-            - storage_flux: 自然表面的 SEBAL 计算结果，不透水面为 0
-            - storage_feature: 不透水面的 Q*，自然表面为 0
+            (storage_flux, building_feature):
+            - storage_flux: 完整的储热通量（自然表面 SEBAL，不透水面 β×Q*）
+            - building_feature: 建筑区的 Q*，用于 ALS 回归估计额外贡献
         """
         return self.storage_heat_flux, self.storage_feature
+
+    @property
+    def impervious_storage_flux(self) -> np.ndarray:
+        """
+        仅获取不透水面的基础储热通量（调试用）
+
+        返回:
+            不透水面基础储热 (W/m²): β_impervious × Q* (仅不透水区域)
+        """
+        impervious_mask = self._get_impervious_mask()
+        result = np.where(impervious_mask, self.beta_impervious * self.Q_star, 0.0)
+        return result.astype(np.float32)

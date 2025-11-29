@@ -4,9 +4,7 @@
 整合能量平衡系数计算流程，提供统一接口。
 
 计算内容:
-    - 短波辐射计算（基于地形和日地关系）
-    - 发射率估算（如未提供）
-    - 反照率估算（如未提供）
+    - 短波辐射计算（水平面太阳辐射，适用于城市冠层模型）
     - 储热通量（基于LCZ分类计算：自然表面SEBAL / 不透水面储热系数）
     - 能量平衡系数 (f_Ta_coeff, residual)
 
@@ -36,7 +34,6 @@ def calculate_energy_balance(
     aero_collection: Union[RasterCollection, CachedRasterCollection],
     datetime_obj: datetime,
     std_meridian: float = 120.0,
-    consider_terrain: bool = True,
     verbose: bool = True,
     cache_dir: Optional[str] = None,
     restart: bool = False
@@ -46,6 +43,8 @@ def calculate_energy_balance(
 
     从两个集合读取数据：原始数据从 input_collection，空气动力学参数从 aero_collection。
     结果存入新的集合返回，输入集合不会被修改。
+
+    短波辐射计算使用水平面太阳辐射，适用于城市冠层模型（Urban Canopy Layer）。
 
     参数:
         input_collection: 原始数据集合（RasterCollection 或 CachedRasterCollection），需包含:
@@ -59,7 +58,6 @@ def calculate_energy_balance(
             - pressure
         datetime_obj: 观测日期时间
         std_meridian: 标准经度 (默认120度，东八区)
-        consider_terrain: 是否考虑地形对太阳辐射的影响
         verbose: 是否打印统计信息
         cache_dir: 缓存目录路径（启用后使用磁盘缓存）
         restart: 是否强制重新计算并覆盖缓存
@@ -121,17 +119,13 @@ def calculate_energy_balance(
     dem_geotransform = (transform.c, transform.a, transform.b,
                         transform.f, transform.d, transform.e)
 
-    # 获取预计算的 slope 和 aspect
-    slope_array = input_collection.get_array('slope')
-    aspect_array = input_collection.get_array('aspect')
-
-    # 计算短波下行辐射（基于日期时间和地形）
+    # 计算短波下行辐射（水平面太阳辐射，用于城市冠层模型）
     # 获取 CRS 信息用于坐标转换
     target_crs = aero_collection.target_crs
     
     if verbose:
         print("计算短波下行辐射 (S↓)...")
-        print(f"  考虑地形效应: {'是' if consider_terrain else '否'}")
+        print("  计算模式: 水平面太阳辐射 (Urban Canopy Layer)")
         print(f"  坐标系: {target_crs}")
         
         # 打印中心点坐标用于调试
@@ -158,11 +152,8 @@ def calculate_energy_balance(
     sw_down = calculate_dem_solar_radiation(
         dem_array=dem,
         dem_geotransform=dem_geotransform,
-        slope_array=slope_array,
-        aspect_array=aspect_array,
         datetime_obj=datetime_obj,
         std_meridian=std_meridian,
-        consider_terrain=consider_terrain,
         target_crs=target_crs
     )
 
@@ -180,23 +171,31 @@ def calculate_energy_balance(
     albedo = input_collection.get_array('landsat_albedo')
     # 统计 LCZ 分布
     if verbose:
+        # 有效 LCZ 掩膜（1-14，排除 0/nodata）
+        valid_lcz_mask = (lcz >= 1) & (lcz <= 14)
+        valid_lcz_count = np.sum(valid_lcz_mask)
+        
         # 不透水面统计
         impervious_mask = np.zeros_like(lcz, dtype=bool)
         for lcz_val, is_imperv in LCZ_IMPERVIOUS.items():
             if is_imperv:
                 impervious_mask |= (lcz == lcz_val)
-        imperv_ratio = np.nansum(impervious_mask) / np.sum(~np.isnan(lcz.astype(float))) * 100
+        imperv_ratio = np.sum(impervious_mask) / valid_lcz_count * 100
 
         # 城市/自然分布
         urban_mask = np.isin(lcz, list(URBAN_LCZ_TYPES))
         natural_mask = np.isin(lcz, list(NATURAL_LCZ_TYPES))
-        urban_ratio = np.nansum(urban_mask) / np.sum(~np.isnan(lcz.astype(float))) * 100
-        natural_ratio = np.nansum(natural_mask) / np.sum(~np.isnan(lcz.astype(float))) * 100
+        urban_ratio = np.sum(urban_mask) / valid_lcz_count * 100
+        natural_ratio = np.sum(natural_mask) / valid_lcz_count * 100
+        
+        # 显示 nodata 比例
+        nodata_ratio = (1 - valid_lcz_count / lcz.size) * 100
 
-        print("LCZ 分布:")
+        print("LCZ 分布 (仅统计有效值 1-14):")
         print(f"  城市建筑 (1-9): {urban_ratio:.1f}%")
         print(f"  自然地表 (10-14): {natural_ratio:.1f}%")
         print(f"  不透水面: {imperv_ratio:.1f}%")
+        print(f"  (nodata/边界外: {nodata_ratio:.1f}%)")
         print("储热计算:")
         print("  自然表面: SEBAL 公式直接计算")
         print("  不透水面: 储热系数在 ALS 回归中估计")
@@ -235,14 +234,16 @@ def calculate_energy_balance(
             target_crs=aero_collection.target_crs,
             target_bounds=aero_collection.target_bounds
         )
+    # 复制地理信息（使用深拷贝避免引用问题）
     output._reference_bounds = aero_collection._reference_bounds
-    output._reference_info = aero_collection._reference_info
+    output._reference_info = aero_collection._reference_info.copy() if aero_collection._reference_info else None
     output._is_georeferenced = aero_collection._is_georeferenced
     output.original_resolutions = aero_collection.original_resolutions.copy()
     
     # 将结果添加到输出集合
     output.add_array('shortwave_down', sw_down)
-    output.add_array('f_Ta_coeff', coeffs['f_Ta_coeff'])
+    output.add_array('f_Ta_coeff2', coeffs['f_Ta_coeff2'])  # 二次项系数
+    output.add_array('f_Ta_coeff1', coeffs['f_Ta_coeff1'])  # 一次项系数
     output.add_array('residual', coeffs['residual'])
     output.add_array('soil_heat_flux', coeffs['soil_heat_flux'])
     output.add_array('latent_heat_flux', coeffs['latent_heat_flux'])
@@ -253,6 +254,10 @@ def calculate_energy_balance(
 
     # 验证
     if verbose:
-        validate_energy_balance(coeffs['f_Ta_coeff'], coeffs['residual'])
+        validate_energy_balance(
+            coeffs['f_Ta_coeff2'], 
+            coeffs['f_Ta_coeff1'], 
+            coeffs['residual']
+        )
     
     return output

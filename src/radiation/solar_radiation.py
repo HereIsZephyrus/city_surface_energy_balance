@@ -111,29 +111,27 @@ class SolarConstantsCalculator:
 
 class SolarRadiationCalculator:
     """
-    Solar radiation calculator - calculates radiation for entire DEM arrays
+    Solar radiation calculator for horizontal surfaces (Urban Canopy Layer)
+
+    Calculates shortwave radiation on horizontal surfaces without terrain effects.
+    Suitable for urban energy balance models where radiation is input to the urban canopy.
 
     Responsibilities:
     - Calculate atmospheric transmissivity based on elevation array
-    - Calculate incident angles for terrain
-    - Calculate direct, diffuse, and global radiation arrays
-    - Work with numpy ndarrays after DEM is loaded
+    - Calculate direct and diffuse radiation for horizontal surfaces
+    - Work with numpy ndarrays
     """
 
-    def __init__(self, solar_constants: SolarConstantsCalculator, elevation: np.ndarray, slope: np.ndarray, aspect: np.ndarray):
+    def __init__(self, solar_constants: SolarConstantsCalculator, elevation: np.ndarray):
         """
         Initialize radiation calculator
 
         Parameters:
             solar_constants: SolarConstantsCalculator instance for sun geometry
             elevation: elevation array in meters (ndarray)
-            slope: slope array in radians (ndarray)
-            aspect: aspect array in radians (ndarray)
         """
         self.constants = solar_constants
         self.elevation = elevation
-        self.slope = slope
-        self.aspect = aspect
 
     @property
     def atmospheric_transmissivity(self) -> np.ndarray:
@@ -150,81 +148,36 @@ class SolarRadiationCalculator:
         return np.clip(tau_sw, 0.1, 1.0).astype(np.float32)
 
     @property
-    def incident_angle(self) -> np.ndarray:
-        """
-        Calculate solar incident angle on inclined terrain
-
-        equation: cos(θ) = sin(α)*cos(s) + cos(α)*sin(s)*cos(A_sun - A_slope)
-
-        Returns:
-            incident angle array in radians (ndarray)
-        """
-        cos_incident = (np.sin(self.constants.sun_elevation_angle) * np.cos(self.slope) +
-                       np.cos(self.constants.sun_elevation_angle) * np.sin(self.slope) *
-                       np.cos(self.constants.sun_azimuth_angle - self.aspect))
-
-        cos_incident = np.clip(cos_incident, -1, 1)
-        return np.arccos(cos_incident)
-
-    @property
     def direct_radiation(self) -> np.ndarray:
         """
-        Calculate direct solar radiation
+        Calculate direct solar radiation on horizontal surface
 
-        equation: S↓ = Gsc × cosθ × dr × τ_sw
-        reference: Laipelt et al., 2021 公式(3)
+        equation: S↓_direct = Gsc × sin(α) × dr × τ_sw
+        where α is solar elevation angle
 
         Returns:
             direct radiation array in W/m² (ndarray)
         """
-        cos_incident = np.cos(self.incident_angle)
-
-        # No radiation when sun is below horizon
-        s_down = np.where(
-            cos_incident > 0,
-            self.constants.Gsc * cos_incident * self.constants.earth_sun_distance * self.atmospheric_transmissivity,
-            0.0
-        )
-
-        return np.maximum(s_down, 0.0).astype(np.float32)
-
-    @property
-    def diffuse_radiation(self) -> np.ndarray:
-        """
-        Calculate diffuse radiation (simplified isotropic sky model)
-
-        Diffuse radiation comes from the entire sky hemisphere, not just the sun direction.
-        It depends on:
-        - Solar elevation angle (higher sun = more scattering in atmosphere)
-        - Sky view factor (terrain slope reduces visible sky)
-
-        equation: Rd = 0.25 * Gsc * τ_sw * sin(α_sun) * SVF
-        where SVF (sky view factor) ≈ (1 + cos(slope)) / 2
-
-        Returns:
-            diffuse radiation array in W/m² (ndarray)
-        """
-        # Use solar elevation angle (not terrain incident angle)
         sun_elevation = self.constants.sun_elevation_angle
         
         if sun_elevation <= 0:
             return np.zeros_like(self.elevation, dtype=np.float32)
         
-        # Sky view factor: fraction of sky visible from sloped surface
-        # SVF = 1 for flat surface, decreases with steeper slopes
-        sky_view_factor = (1 + np.cos(self.slope)) / 2
-        
-        # Diffuse radiation from sky
-        diffuse = 0.25 * self.constants.Gsc * self.atmospheric_transmissivity * np.sin(sun_elevation) * sky_view_factor
+        # Direct radiation on horizontal surface = Gsc * sin(solar_elevation) * dr * tau
+        s_down = (self.constants.Gsc * np.sin(sun_elevation) * 
+                  self.constants.earth_sun_distance * self.atmospheric_transmissivity)
 
-        return np.maximum(diffuse, 0.0).astype(np.float32)
+        return np.maximum(s_down, 0.0).astype(np.float32)
 
     @property
     def global_radiation(self) -> np.ndarray:
         """
-        Calculate global shortwave downward radiation
+        Calculate global shortwave downward radiation on horizontal surface
 
-        equation: Rs↓ = Rd + Rd_diffuse
+        SEBAL公式: Rs↓ = Gsc × dr × sin(θ) × τsw
+
+        注意: τsw 是大气总透射率，已经包含了散射的影响，
+        因此不需要额外添加散射辐射项。
 
         Returns:
             global radiation array in W/m² (ndarray)
@@ -232,34 +185,26 @@ class SolarRadiationCalculator:
         if self.constants.sun_elevation_angle <= 0:
             return np.zeros_like(self.elevation, dtype=np.float32)
 
-        return (self.direct_radiation + self.diffuse_radiation).astype(np.float32)
+        # 直接使用 SEBAL 公式，τsw 已包含散射影响
+        return self.direct_radiation
 
 
 def calculate_dem_solar_radiation(dem_array: np.ndarray,
                                   dem_geotransform: Tuple,
-                                  slope_array: np.ndarray,
-                                  aspect_array: np.ndarray,
                                   datetime_obj: datetime,
                                   std_meridian: float = 120.0,
-                                  consider_terrain: bool = True,
                                   target_crs: Optional[str] = None) -> np.ndarray:
     """
-    Calculate shortwave downward radiation for entire DEM array
+    Calculate shortwave downward radiation on horizontal surfaces (Urban Canopy Layer)
 
-    This is a helper function that orchestrates the calculation workflow:
-    1. Use provided slope and aspect arrays
-    2. Create solar constants calculator (center coordinates)
-    3. Create radiation calculator with arrays
-    4. Return global radiation array
+    This function calculates solar radiation for horizontal surfaces without terrain effects.
+    Suitable for urban energy balance models.
 
     Parameters:
-        dem_array: elevation array in meters (ndarray)
+        dem_array: elevation array in meters (ndarray) - used for atmospheric transmissivity
         dem_geotransform: geotransform tuple (x_min, pixel_width, 0, y_max, 0, -pixel_height)
-        slope_array: pre-computed slope array in radians (ndarray)
-        aspect_array: pre-computed aspect array in radians (ndarray)
         datetime_obj: calculation datetime
         std_meridian: standard meridian in degrees (default 120 for China)
-        consider_terrain: whether to consider slope and aspect effects
         target_crs: coordinate reference system string (e.g., 'EPSG:32650')
                    If provided, coordinates will be transformed to WGS84 for solar calculations
 
@@ -299,14 +244,6 @@ def calculate_dem_solar_radiation(dem_array: np.ndarray,
     center_lat = np.radians(center_lat_deg)
     center_lon = np.radians(center_lon_deg)
 
-    # Determine slope and aspect arrays
-    if consider_terrain:
-        slopes = slope_array.astype(np.float32)
-        aspects = aspect_array.astype(np.float32)
-    else:
-        slopes = np.zeros_like(dem_array, dtype=np.float32)
-        aspects = np.zeros_like(dem_array, dtype=np.float32)
-
     # Create solar constants calculator
     solar_constants = SolarConstantsCalculator(
         latitude=center_lat,
@@ -315,12 +252,10 @@ def calculate_dem_solar_radiation(dem_array: np.ndarray,
         std_meridian=std_meridian
     )
 
-    # Create radiation calculator
+    # Create radiation calculator (horizontal surface only)
     rad_calculator = SolarRadiationCalculator(
         solar_constants=solar_constants,
-        elevation=dem_array,
-        slope=slopes,
-        aspect=aspects
+        elevation=dem_array
     )
 
     # Calculate and return global radiation

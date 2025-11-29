@@ -14,12 +14,10 @@
 import pickle
 import numpy as np
 import xarray as xr
-import geopandas as gpd
 import rasterio
 from pathlib import Path
 from typing import Union, Dict, List, Optional, Tuple
 from rasterio.enums import Resampling
-from rasterio.features import rasterize
 from rasterio.transform import Affine
 from .raster_manager import RasterData, RasterBand
 
@@ -295,46 +293,50 @@ class CachedRasterCollection:
                 da.name = name
                 self.original_resolutions[name] = abs(da.rio.resolution()[0])
         
-        # 分辨率重采样
-        already_aligned = False
-        if self.target_resolution is not None:
+        # 强制对齐到目标网格（无论分辨率是否匹配都需要对齐）
+        if self.target_resolution is not None and self._reference_bounds is not None and self._reference_info is not None:
             if hasattr(da, 'rio'):
                 current_res = abs(da.rio.resolution()[0])
-                if abs(current_res - self.target_resolution) > 1e-6:
+                needs_resample = abs(current_res - self.target_resolution) > 1e-6
+                
+                if needs_resample:
                     print(f"  重采样 {name}: {current_res:.1f}m → {self.target_resolution:.1f}m")
-                    if self._reference_bounds is not None and self._reference_info is not None:
-                        # 使用 reference_info 中的尺寸，确保与 set_reference 计算一致
-                        bounds = self._reference_bounds
-                        ref_width = self._reference_info['width']
-                        ref_height = self._reference_info['height']
-                        res = self.target_resolution
-                        
-                        # 生成像素中心坐标（从左上角开始）
-                        target_x = np.linspace(
-                            bounds[0] + res / 2,
-                            bounds[0] + res / 2 + (ref_width - 1) * res,
-                            ref_width
-                        )
-                        target_y = np.linspace(
-                            bounds[3] - res / 2,
-                            bounds[3] - res / 2 - (ref_height - 1) * res,
-                            ref_height
-                        )
-                        
-                        original_crs = da.rio.crs
-                        da = da.interp(x=target_x, y=target_y, method='linear')
-                        da.name = name
-                        da = da.rio.write_crs(original_crs)
-                        already_aligned = True
-        
-        # 裁剪到参考范围
-        if not already_aligned and self._reference_bounds is not None and hasattr(da, 'rio'):
-            bounds = self._reference_bounds
-            da = da.rio.clip_box(
-                minx=bounds[0], miny=bounds[1],
-                maxx=bounds[2], maxy=bounds[3]
-            )
-            da.name = name
+                else:
+                    print(f"  对齐 {name} 到目标网格")
+                
+                # 使用 rio.reproject 进行重采样，确保正确处理边缘插值
+                # 这比 interp 更可靠，特别是对于低分辨率数据（如 ERA5）
+                ref_info = self._reference_info
+                resampling_map = {
+                    'bilinear': Resampling.bilinear,
+                    'nearest': Resampling.nearest,
+                    'cubic': Resampling.cubic
+                }
+                resampling_method = resampling_map.get(resampling, Resampling.bilinear)
+                
+                # 使用 reproject 重采样到目标网格
+                da = da.rio.reproject(
+                    dst_crs=self.target_crs,
+                    shape=(ref_info['height'], ref_info['width']),
+                    transform=ref_info['transform'],
+                    resampling=resampling_method
+                )
+                da.name = name
+                
+                # 对于低分辨率数据（如 ERA5），边缘可能仍有 NaN 值
+                # 使用该要素的均值填充这些缺失值
+                if needs_resample and current_res > self.target_resolution * 10:
+                    # 只对分辨率差异大于10倍的数据进行填充（如 ERA5 ~11km vs Landsat 10m）
+                    arr = da.values
+                    nan_mask = np.isnan(arr)
+                    nan_count = np.sum(nan_mask)
+                    if nan_count > 0:
+                        mean_val = np.nanmean(arr)
+                        if np.isfinite(mean_val):
+                            arr[nan_mask] = mean_val
+                            da = da.copy(data=arr)
+                            da.name = name
+                            print(f"    填充 {nan_count} 个边缘 NaN 值 (使用均值 {mean_val:.4f})")
         
         # 压缩 band 维度
         if da.ndim == 3 and da.shape[0] == 1:
@@ -361,57 +363,6 @@ class CachedRasterCollection:
             full_name = f"{prefix}_{name}" if prefix else name
             self.add_raster(full_name, filepath, band=band, resampling=resampling)
     
-    def add_vector_raster(
-        self,
-        name: str,
-        vector_path: Union[str, Path],
-        attribute: str,
-        default_value: float = 0,
-        dtype: type = np.float32
-    ) -> None:
-        """将矢量数据栅格化并添加到集合"""
-        if not self._is_georeferenced:
-            raise RuntimeError("地理参考未初始化！必须先调用 set_reference() 方法。")
-        
-        vector_path = Path(vector_path)
-        if not vector_path.exists():
-            raise FileNotFoundError(f"矢量文件不存在: {vector_path}")
-        
-        gdf = gpd.read_file(vector_path)
-        print(f"  读取矢量: {vector_path.name} ({len(gdf)} 个要素)")
-        
-        if gdf.crs is not None and str(gdf.crs) != str(self.target_crs):
-            print(f"  坐标转换: {gdf.crs} → {self.target_crs}")
-            gdf = gdf.to_crs(self.target_crs)
-        
-        ref_info = self.get_reference_info()
-        
-        shapes = [
-            (geom, value)
-            for geom, value in zip(gdf.geometry, gdf[attribute])
-            if geom is not None and not geom.is_empty
-        ]
-        
-        if not shapes:
-            raise ValueError(f"矢量文件中没有有效的几何体或属性 '{attribute}'")
-        
-        raster_array = rasterize(
-            shapes=shapes,
-            out_shape=(ref_info['height'], ref_info['width']),
-            transform=ref_info['transform'],
-            fill=default_value,
-            dtype=dtype
-        )
-        
-        # 保存到磁盘
-        self._save_array(name, raster_array)
-        self.original_resolutions[name] = self.target_resolution
-        print(f"✓ 矢量栅格化: {name} (属性: {attribute}, 形状: {raster_array.shape})")
-        
-        # 释放内存
-        del gdf
-        del raster_array
-    
     def get_array(self, name: str, dtype: type = np.float64) -> np.ndarray:
         """
         从磁盘获取指定栅格的 numpy 数组
@@ -435,6 +386,16 @@ class CachedRasterCollection:
         """
         if not self._is_georeferenced:
             raise RuntimeError("地理参考未初始化！必须先调用 set_reference() 方法。")
+        
+        ref_info = self.get_reference_info()
+        expected_shape = (ref_info['height'], ref_info['width'])
+        
+        # 尺寸检查
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"数组 '{name}' 尺寸不匹配！"
+                f"期望 {expected_shape}，实际 {array.shape}"
+            )
         
         self._save_array(name, array)
     
@@ -478,6 +439,7 @@ class CachedRasterCollection:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         ref_info = self.get_reference_info()
+        expected_shape = (ref_info['height'], ref_info['width'])
         
         with rasterio.open(
             output_path, 'w',
@@ -494,6 +456,14 @@ class CachedRasterCollection:
             for i, (name, arr) in enumerate(bands, 1):
                 if arr.ndim == 3:
                     arr = arr[0, :, :]
+                
+                # 尺寸检查
+                if arr.shape != expected_shape:
+                    raise ValueError(
+                        f"波段 '{name}' 尺寸不匹配！"
+                        f"期望 {expected_shape}，实际 {arr.shape}"
+                    )
+                
                 dst.write(arr.astype(dtype), i)
                 dst.set_band_description(i, name)
         

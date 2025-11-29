@@ -20,11 +20,11 @@ from typing import Dict
 # ============================================================================
 
 ERA5_BANDS: Dict[str, int] = {
-    'surface_pressure': 19,         # Pa - 地表气压
-    'dewpoint_temperature_2m': 18,  # K - 2米露点温度
-    'u_component_of_wind_10m': 14,  # m/s - 10米U风分量
-    'v_component_of_wind_10m': 15,  # m/s - 10米V风分量
-    'temperature_2m': 16            # K - 2米气温
+    'surface_pressure': 3,         # Pa - 地表气压
+    'dewpoint_temperature_2m': 6,  # K - 2米露点温度
+    'u_component_of_wind_10m': 5,  # m/s - 10米U风分量
+    'v_component_of_wind_10m': 2,  # m/s - 10米V风分量
+    'temperature_2m': 4            # K - 2米气温
 }
 
 

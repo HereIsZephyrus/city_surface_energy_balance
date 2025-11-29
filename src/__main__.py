@@ -48,8 +48,6 @@ def load_and_align_data(
     landsat_path: str,
     dem_path: str,
     lcz_path: str,
-    slope_path: str,
-    aspect_path: str,
     building_path: Optional[str] = None,
     target_crs: str = 'EPSG:32650',
     target_resolution: float = 10.0,
@@ -63,7 +61,7 @@ def load_and_align_data(
         era5_path: ERA5 tif文件路径
         landsat_path: Landsat tif文件路径
         dem_path: DEM tif文件路径
-        lcz_path: LCZ矢量文件路径（.gpkg，需有"LCZ"属性字段）
+        lcz_path: LCZ栅格文件路径（.tif，值为1-14的LCZ分类）
         building_path: 建筑数据文件路径（.gpkg，可选，用于计算粗糙度）
         target_crs: 目标坐标系
         target_resolution: 目标分辨率(m)
@@ -119,14 +117,9 @@ def load_and_align_data(
     print("加载 DEM 数据...")
     collection.add_raster('dem', dem_path, band=1)
 
-    # 添加LCZ数据
+    # 添加LCZ数据（栅格输入）
     print("加载 LCZ 数据...")
-    collection.add_vector_raster('lcz', lcz_path, attribute='LCZ')
-
-    # 加载预计算的坡度和坡向数据（如果提供）
-    collection.add_raster('slope', slope_path, band=1)
-    
-    collection.add_raster('aspect', aspect_path, band=1)
+    collection.add_raster('lcz', lcz_path, band=1, resampling='nearest')
 
     # 如果提供了建筑数据，计算粗糙度参数
     if building_path is not None:
@@ -158,7 +151,8 @@ def load_and_align_data(
 
 # 输出波段配置
 OUTPUT_BANDS = [
-    'f_Ta_coeff',
+    'f_Ta_coeff2',            # 二次项系数 (W/m²/K²)
+    'f_Ta_coeff1',            # 一次项系数 (W/m²/K)
     'residual',
     'shortwave_down',
     'era5_temperature_2m',
@@ -180,43 +174,41 @@ OUTPUT_BANDS = [
 
 
 def save_results(
-    input_collection: Union[RasterCollection, CachedRasterCollection],
-    aero_collection: RasterCollection,
-    balance_collection: RasterCollection,
-    output_path: str
+    collection: Union[RasterCollection, CachedRasterCollection],
+    output_path: str,
+    band_names: list = None
 ) -> None:
     """
-    保存计算结果到GeoTIFF
+    保存单个集合的计算结果到GeoTIFF
     
     参数:
-        input_collection: 包含原始数据的集合
-        aero_collection: 包含空气动力学参数的集合
-        balance_collection: 包含能量平衡结果的集合
+        collection: 包含数据的集合
         output_path: 输出文件路径
+        band_names: 要保存的波段名称列表（默认保存集合中所有波段）
     """
     print("\n" + "=" * 60)
-    print("步骤 4: 保存结果")
+    print(f"保存结果: {output_path}")
     print("=" * 60)
 
-    # 从三个集合中获取波段数据（按优先级：balance > aero > input）
+    # 确定要保存的波段
+    if band_names is None:
+        # 默认保存集合中所有波段
+        band_names = list(collection.rasters.keys())
+
+    # 从集合中获取波段数据
     bands = []
-    for name in OUTPUT_BANDS:
-        if name in balance_collection.rasters:
-            arr = balance_collection.get_array(name)
-            bands.append((name, arr))
-        elif name in aero_collection.rasters:
-            arr = aero_collection.get_array(name)
-            bands.append((name, arr))
-        elif name in input_collection.rasters:
-            arr = input_collection.get_array(name)
+    for name in band_names:
+        if name in collection.rasters:
+            arr = collection.get_array(name)
             bands.append((name, arr))
         else:
             print(f"  警告: 波段 '{name}' 不存在，跳过")
 
-    # 保存（使用 balance_collection 的地理信息）
-    balance_collection.save_multiband(output_path=output_path, bands=bands)
+    # 保存
+    collection.save_multiband(output_path=output_path, bands=bands)
 
     # 打印波段列表
+    print(f"  保存了 {len(bands)} 个波段:")
     for i, (name, _) in enumerate(bands, 1):
         print(f"    {i:2d}. {name}")
 
@@ -234,13 +226,11 @@ def main():
 示例:
     # 基本用法
     python -m src --era5 era5.tif --landsat landsat.tif --dem dem.tif \\
-        --lcz lcz.gpkg --slope slope.tif --aspect aspect.tif \\
-        --datetime 202308151030 -o result.tif
+        --lcz lcz.tif --datetime 202308151030 -o result.tif
     
     # 使用建筑数据计算粗糙度
     python -m src --era5 era5.tif --landsat landsat.tif --dem dem.tif \\
-        --lcz lcz.gpkg --slope slope.tif --aspect aspect.tif \\
-        --building buildings.gpkg --datetime 202308151030 -o result.tif
+        --lcz lcz.tif --building buildings.gpkg --datetime 202308151030 -o result.tif
 
 LCZ编码:
     1-9:  城市建筑类型 (密集高层~稀疏建筑)
@@ -259,13 +249,16 @@ LCZ编码:
 波段配置:
     ERA5: surface_pressure(19), dewpoint_2m(18), u_wind(14), v_wind(15), temp_2m(16)
     Landsat: ndvi(9), fvc(10), lst(19), albedo(11), emissivity(12)
+
+注意:
+    短波辐射使用水平面太阳辐射计算，适用于城市冠层模型 (Urban Canopy Layer)。
         """
     )
 
     parser.add_argument('--era5', required=True, help='ERA5 tif文件路径')
     parser.add_argument('--landsat', required=True, help='Landsat tif文件路径')
     parser.add_argument('--dem', required=True, help='DEM tif文件路径')
-    parser.add_argument('--lcz', required=True, help='LCZ矢量文件路径 (.gpkg，需有"LCZ"属性字段)')
+    parser.add_argument('--lcz', required=True, help='LCZ栅格文件路径 (.tif，值为1-14的LCZ分类)')
     parser.add_argument('-o', '--output', required=True, help='输出tif文件路径')
     parser.add_argument('--crs', default='EPSG:32650', help='目标坐标系 (默认: EPSG:32650)')
     parser.add_argument('--resolution', type=float, default=10.0, help='目标分辨率(m)')
@@ -273,8 +266,6 @@ LCZ编码:
     parser.add_argument('--std-meridian', type=float, default=120.0, help='标准经度 (默认: 120.0 东八区)')
     parser.add_argument('--cachedir', type=str, help='缓存目录路径（启用后数据存储到磁盘而非内存）')
     parser.add_argument('--restart', action='store_true', help='强制重新计算并覆盖缓存（需配合 --cachedir 使用）')
-    parser.add_argument('--slope', required=True, help='预计算的坡度文件路径 (slope.tif，弧度制)')
-    parser.add_argument('--aspect', required=True, help='预计算的坡向文件路径 (aspect.tif，弧度制)')
     parser.add_argument('--building', type=str, default=None, help='建筑数据文件路径 (.gpkg，需包含 height, area, voroniarea, min_proj, max_proj, district_id, spectral_cluster 字段)')
 
     args = parser.parse_args()
@@ -314,8 +305,6 @@ LCZ编码:
             landsat_path=args.landsat,
             dem_path=args.dem,
             lcz_path=args.lcz,
-            slope_path=args.slope,
-            aspect_path=args.aspect,
             building_path=args.building,
             target_crs=args.crs,
             target_resolution=args.resolution,
@@ -334,6 +323,8 @@ LCZ编码:
             cache_dir=aero_cache_dir,
             restart=args.restart
         )
+        air_output_path = args.output.replace(".tif", "_aerodynamic.tif")
+        save_results(air_collection, air_output_path)
 
         # 解析日期时间
         try:
@@ -360,7 +351,8 @@ LCZ编码:
         )
 
         # 4. 保存结果（需要从两个集合获取数据）
-        save_results(collection, air_collection, balance_collection, args.output)
+        balance_output_path = args.output.replace(".tif", "_balance.tif")
+        save_results(balance_collection, balance_output_path)
 
         print("\n" + "=" * 60)
         print("✓ 计算完成!")
