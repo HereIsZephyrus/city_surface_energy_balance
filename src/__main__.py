@@ -105,11 +105,18 @@ def create_regression_parser(subparsers):
     parser.add_argument('--district-id', default='district_id',
                         help='街区ID字段名 (默认: district_id)')
     parser.add_argument('--x-f', type=str, default=None,
-                        help='人为热Q_F特征列名，逗号分隔')
+                        help='人为热Q_F特征列名（连续变量），逗号分隔')
     parser.add_argument('--x-s', type=str, default=None,
-                        help='储热ΔQ_Sb特征列名，逗号分隔')
-    parser.add_argument('--x-a', type=str, default=None,
-                        help='水平交换ΔQ_A特征列名，逗号分隔')
+                        help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
+    parser.add_argument('--x-c', type=str, default=None,
+                        help='分类特征列名（将进行one-hot编码），逗号分隔')
+    
+    # 空间自相关参数（水平交换项 ΔQ_A）
+    parser.add_argument('--distance-threshold', type=float, default=5000.0,
+                        help='空间权重距离阈值(m)，街区边界距离小于此值视为邻居 (默认: 5000)')
+    parser.add_argument('--distance-decay', type=str, default='binary',
+                        choices=['binary', 'linear', 'inverse', 'gaussian'],
+                        help='距离衰减函数 (默认: binary)')
     
     # 回归参数
     parser.add_argument('--max-iter', type=int, default=20,
@@ -162,15 +169,23 @@ def create_full_parser(subparsers):
     reg_group.add_argument('--district-id', default='district_id',
                            help='街区ID字段名')
     reg_group.add_argument('--x-f', type=str, default=None,
-                           help='人为热Q_F特征列名，逗号分隔')
+                           help='人为热Q_F特征列名（连续变量），逗号分隔')
     reg_group.add_argument('--x-s', type=str, default=None,
-                           help='储热ΔQ_Sb特征列名，逗号分隔')
-    reg_group.add_argument('--x-a', type=str, default=None,
-                           help='水平交换ΔQ_A特征列名，逗号分隔')
+                           help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
+    reg_group.add_argument('--x-c', type=str, default=None,
+                           help='分类特征列名（将进行one-hot编码），逗号分隔')
     reg_group.add_argument('--max-iter', type=int, default=20,
                            help='ALS最大迭代次数')
     reg_group.add_argument('--tol', type=float, default=1e-4,
                            help='收敛容差')
+    
+    # === 空间自相关参数（水平交换项 ΔQ_A）===
+    spatial_group = parser.add_argument_group('空间自相关参数')
+    spatial_group.add_argument('--distance-threshold', type=float, default=5000.0,
+                               help='空间权重距离阈值(m) (默认: 5000)')
+    spatial_group.add_argument('--distance-decay', type=str, default='binary',
+                               choices=['binary', 'linear', 'inverse', 'gaussian'],
+                               help='距离衰减函数 (默认: binary)')
     
     # === 缓存和输出 ===
     cache_group = parser.add_argument_group('缓存和输出')
@@ -194,8 +209,8 @@ def run_physics(args):
 
 def run_regression(args):
     """执行回归分析模式"""
-    from .regression import main as regression_main
-    regression_main(args)
+    from .anylysis import main as anylysis_main
+    anylysis_main(args)
 
 
 def run_full(args):
@@ -240,21 +255,23 @@ def run_full(args):
     print("\n>>> 阶段 2/2: 街区回归 <<<")
     
     # 构建 regression 参数
-    regression_args = SimpleNamespace(
+    anylysis_args = SimpleNamespace(
         cachedir=args.cachedir,
         districts=args.districts,
         output=args.output,
         district_id=getattr(args, 'district_id', 'district_id'),
         x_f=getattr(args, 'x_f', None),
         x_s=getattr(args, 'x_s', None),
-        x_a=getattr(args, 'x_a', None),
+        x_c=getattr(args, 'x_c', None),
+        distance_threshold=getattr(args, 'distance_threshold', 5000.0),
+        distance_decay=getattr(args, 'distance_decay', 'binary'),
         max_iter=getattr(args, 'max_iter', 20),
         tol=getattr(args, 'tol', 1e-4),
         quiet=getattr(args, 'quiet', False)
     )
     
-    from .regression import main as regression_main
-    regression_main(regression_args)
+    from .anylysis import main as anylysis_main
+    anylysis_main(anylysis_args)
     
     print("\n" + "=" * 60)
     print("✓ 完整工作流完成!")
