@@ -24,6 +24,10 @@
     2. 使用 DistrictAggregator 聚合到街区
     3. 使用 DistrictRegressionModel 求解街区Ta
 
+使用方法:
+    python -m src regression --cachedir <cache_dir> --districts <districts.gpkg> \\
+        -o <output.gpkg>
+
 参考文献:
     doc/晴朗无风条件下城市生态空间对城市降温作用量化模型.md
     doc/DISTRICT_REGRESSION_WORKFLOW.md
@@ -36,9 +40,20 @@ from .district_regression import (
     DistrictRegressionModel
 )
 
+from .workflow import (
+    main,
+    run_district_regression,
+    DEFAULT_AGGREGATE_BANDS,
+)
+
 __all__ = [
     '__version__',
+    # 核心类
     'DistrictAggregator',
     'DistrictRegressionModel',
+    # 工作流函数
+    'main',
+    'run_district_regression',
+    'DEFAULT_AGGREGATE_BANDS',
 ]
 
