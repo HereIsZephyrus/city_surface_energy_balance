@@ -46,7 +46,8 @@ def run_spatial_analysis(
     district_id_field: str = 'district_id',
     distance_threshold: float = 500.0,
     distance_decay: str = 'binary',
-    verbose: bool = True
+    verbose: bool = True,
+    cache_dir: Optional[str] = None
 ) -> gpd.GeoDataFrame:
     """
     执行空间滞后模型分析
@@ -59,6 +60,7 @@ def run_spatial_analysis(
         distance_threshold: 空间权重距离阈值（米）
         distance_decay: 距离衰减函数 ('binary', 'linear', 'inverse', 'gaussian')
         verbose: 是否打印详细信息
+        cache_dir: 空间权重矩阵缓存目录（如果提供，会尝试从缓存加载或保存到缓存）
         
     返回:
         包含空间分析结果的 GeoDataFrame
@@ -77,13 +79,14 @@ def run_spatial_analysis(
     if ta_column not in input_gdf.columns:
         raise ValueError(f"缺少气温列: {ta_column}")
     
-    # 2. 构建空间权重矩阵
+    # 2. 构建空间权重矩阵（支持缓存）
     print("\n[2] 构建空间权重矩阵...")
     spatial_weights = SpatialWeightMatrix(
         districts_gdf=input_gdf,
         distance_threshold=distance_threshold,
         decay_function=distance_decay,
-        row_standardize=True
+        row_standardize=True,
+        cache_dir=cache_dir
     )
     
     # 3. 空间滞后模型分析
@@ -234,6 +237,8 @@ def main(args=None):
         parser.add_argument('--distance-decay', type=str, default='binary',
                             choices=['binary', 'linear', 'inverse', 'gaussian'],
                             help='距离衰减函数')
+        parser.add_argument('--cache-dir', type=str, default=None,
+                            help='空间权重矩阵缓存目录')
         parser.add_argument('--quiet', action='store_true',
                             help='静默模式')
         args = parser.parse_args()
@@ -251,6 +256,8 @@ def main(args=None):
     print(f"  气温列: {args.ta_column}")
     print(f"  距离阈值: {args.distance_threshold} m")
     print(f"  衰减函数: {args.distance_decay}")
+    if args.cache_dir:
+        print(f"  缓存目录: {args.cache_dir}")
 
     try:
         run_spatial_analysis(
@@ -260,7 +267,8 @@ def main(args=None):
             district_id_field=args.district_id,
             distance_threshold=args.distance_threshold,
             distance_decay=args.distance_decay,
-            verbose=not args.quiet
+            verbose=not args.quiet,
+            cache_dir=args.cache_dir
         )
         
         print("\n" + "=" * 60)

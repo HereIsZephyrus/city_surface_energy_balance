@@ -73,6 +73,7 @@ pip install -r requirements.txt
 python -m src physics \
     --era5 era5.tif \
     --landsat landsat.tif \
+    --albedo albedo.tif \
     --dem dem.tif \
     --lcz lcz.tif \
     --datetime 202308151030 \
@@ -88,6 +89,7 @@ python -m src regression \
 python -m src full \
     --era5 era5.tif \
     --landsat landsat.tif \
+    --albedo albedo.tif \
     --dem dem.tif \
     --lcz lcz.tif \
     --datetime 202308151030 \
@@ -95,6 +97,21 @@ python -m src full \
     --cachedir ./cache \
     -o result.gpkg
 ```
+
+### Preparing Albedo
+
+Use the helper script to derive broadband albedo from multispectral Landsat reflectance:
+
+```bash
+python script/compute_albedo.py \
+    --landsat raw_landsat_stack.tif \
+    --blue-band 2 --green-band 3 --red-band 4 \
+    --nir-band 5 --swir1-band 6 --swir2-band 7 \
+    --scale 2.75e-05 --offset -0.2 \
+    -o albedo.tif
+```
+
+Adjust the band indices and scale/offset parameters to match your data product.
 
 ### Python API
 
@@ -124,7 +141,8 @@ results = model.fit_als_regression(...)
 
 ### Required Remote Sensing Data
 - **DEM**: Digital Elevation Model (GeoTIFF)
-- **Landsat**: Surface temperature, albedo, NDVI (GeoTIFF)
+- **Landsat**: Multi-band surface products (GeoTIFF, contains LST/NDVI/FVC/emissivity)
+- **Albedo**: Broadband surface albedo (GeoTIFF, 单独文件，可用 `script/compute_albedo.py` 生成)
 - **LCZ**: Local Climate Zone classification (GeoTIFF, 1-14)
 - **Building Data**: Optional, for roughness calculation (GeoPackage)
 

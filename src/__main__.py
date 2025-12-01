@@ -127,10 +127,12 @@ def create_als_parser(subparsers):
                         help='分类特征列名（将进行one-hot编码），逗号分隔')
     
     # 回归参数
-    parser.add_argument('--max-iter', type=int, default=20,
-                        help='ALS最大迭代次数 (默认: 20)')
+    parser.add_argument('--max-iter', type=int, default=500,
+                        help='ALS最大迭代次数 (默认: 100)')
     parser.add_argument('--tol', type=float, default=1e-4,
                         help='收敛容差 (默认: 1e-4)')
+    parser.add_argument('--ridge-alpha', type=float, default=0.0,
+                        help='岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）')
     parser.add_argument('--quiet', action='store_true',
                         help='静默模式')
     
@@ -209,10 +211,12 @@ def create_regression_parser(subparsers):
                         help='距离衰减函数 (默认: binary)')
     
     # 回归参数
-    parser.add_argument('--max-iter', type=int, default=20,
-                        help='ALS最大迭代次数 (默认: 20)')
+    parser.add_argument('--max-iter', type=int, default=500,
+                        help='ALS最大迭代次数 (默认: 100)')
     parser.add_argument('--tol', type=float, default=1e-4,
                         help='收敛容差 (默认: 1e-4)')
+    parser.add_argument('--ridge-alpha', type=float, default=0.0,
+                        help='岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）')
     parser.add_argument('--quiet', action='store_true',
                         help='静默模式')
     
@@ -269,10 +273,12 @@ def create_full_parser(subparsers):
                            help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
     reg_group.add_argument('--x-c', type=str, default=None,
                            help='分类特征列名（将进行one-hot编码），逗号分隔')
-    reg_group.add_argument('--max-iter', type=int, default=20,
+    reg_group.add_argument('--max-iter', type=int, default=500,
                            help='ALS最大迭代次数')
     reg_group.add_argument('--tol', type=float, default=1e-4,
                            help='收敛容差')
+    reg_group.add_argument('--ridge-alpha', type=float, default=0.0,
+                           help='岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）')
     
     # === 空间自相关参数（水平交换项 ΔQ_A）===
     spatial_group = parser.add_argument_group('空间自相关参数')
@@ -339,8 +345,9 @@ def run_regression(args):
         x_f=getattr(args, 'x_f', None),
         x_s=getattr(args, 'x_s', None),
         x_c=getattr(args, 'x_c', None),
-        max_iter=getattr(args, 'max_iter', 20),
+        max_iter=getattr(args, 'max_iter', 500),
         tol=getattr(args, 'tol', 1e-4),
+        ridge_alpha=getattr(args, 'ridge_alpha', 0.0),
         quiet=getattr(args, 'quiet', False)
     )
     
@@ -433,8 +440,9 @@ def run_full(args):
         x_f=getattr(args, 'x_f', None),
         x_s=getattr(args, 'x_s', None),
         x_c=getattr(args, 'x_c', None),
-        max_iter=getattr(args, 'max_iter', 20),
+        max_iter=getattr(args, 'max_iter', 500),
         tol=getattr(args, 'tol', 1e-4),
+        ridge_alpha=getattr(args, 'ridge_alpha', 0.0),
         quiet=getattr(args, 'quiet', False)
     )
     

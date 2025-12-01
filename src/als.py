@@ -174,8 +174,9 @@ def run_als_regression(
     X_F_columns: Optional[List[str]] = None,
     X_S_columns: Optional[List[str]] = None,
     X_C_columns: Optional[List[str]] = None,
-    max_iter: int = 20,
+    max_iter: int = 100,
     tol: float = 1e-4,
+    ridge_alpha: float = 0.0,
     verbose: bool = True
 ) -> Dict:
     """
@@ -192,6 +193,7 @@ def run_als_regression(
         X_C_columns: 分类特征列名（将进行 one-hot 编码）
         max_iter: ALS最大迭代次数
         tol: 收敛容差
+        ridge_alpha: 岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）
         verbose: 是否打印详细信息
         
     返回:
@@ -370,19 +372,26 @@ def run_als_regression(
     print("\n[4] 准备回归数据...")
     model = ALSRegression()
     
-    f_Ta_column = 'f_Ta_coeff1_mean'
+    f_Ta_coeff1_column = 'f_Ta_coeff1_mean'
+    f_Ta_coeff2_column = 'f_Ta_coeff2_mean'
     residual_column = 'residual_mean'
     era5_Ta_column = 'era5_temperature_2m_mean'
     
-    required_cols = [f_Ta_column, residual_column]
+    required_cols = [f_Ta_coeff1_column, residual_column]
     for col in required_cols:
         if col not in aggregated_df.columns:
             raise ValueError(f"缺少必需列: {col}")
     
-    X_F, X_S, f_Ta_coeffs, y_residual, era5_Ta_mean = model.prepare_regression_data(
+    # 检查是否有二次项系数
+    has_coeff2 = f_Ta_coeff2_column in aggregated_df.columns
+    if not has_coeff2:
+        print(f"  警告: 未找到二次项系数 '{f_Ta_coeff2_column}'，将使用一次近似")
+    
+    X_F, X_S, f_Ta_coeff1, f_Ta_coeff2, y_residual, era5_Ta_mean = model.prepare_regression_data(
         aggregated_df=aggregated_df,
         districts_gdf=districts_gdf,
-        f_Ta_column=f_Ta_column,
+        f_Ta_coeff1_column=f_Ta_coeff1_column,
+        f_Ta_coeff2_column=f_Ta_coeff2_column if has_coeff2 else None,
         residual_column=residual_column,
         era5_Ta_column=era5_Ta_column,
         X_F_columns=X_F_columns,
@@ -391,17 +400,25 @@ def run_als_regression(
     )
     
     print(f"  特征维度: X_F={X_F.shape}, X_S={X_S.shape}")
-    print(f"  样本数量: {len(f_Ta_coeffs)}")
+    print(f"  样本数量: {len(f_Ta_coeff1)}")
+    if f_Ta_coeff2 is not None:
+        print(f"  使用二次能量平衡方程: f(Ta) = a×Ta² + b×Ta + c = 0")
+    else:
+        print(f"  使用一次能量平衡方程: f(Ta) = b×Ta + c = 0")
     
     print("\n[5] ALS 回归求解...")
+    if ridge_alpha > 0:
+        print(f"  使用岭回归正则化 (alpha={ridge_alpha:.2e})")
     results = model.fit(
         X_F=X_F,
         X_S=X_S,
-        f_Ta_coeffs=f_Ta_coeffs,
+        f_Ta_coeff1=f_Ta_coeff1,
+        f_Ta_coeff2=f_Ta_coeff2,
         y_residual=y_residual,
         era5_Ta_mean=era5_Ta_mean,
         max_iter=max_iter,
         tol=tol,
+        ridge_alpha=ridge_alpha,
         verbose=verbose
     )
     
@@ -413,6 +430,10 @@ def run_als_regression(
         X_S_columns=X_S_columns,
         spatial_analysis=None  # 空间分析将在单独的模块中进行
     )
+    
+    # 将 'district_id' 列重命名为实际使用的字段名
+    if 'district_id' in results_df.columns and district_id_field != 'district_id':
+        results_df = results_df.rename(columns={'district_id': district_id_field})
     
     # 合并到街区 GeoDataFrame
     output_gdf = districts_gdf.merge(results_df, on=district_id_field, how='left')
@@ -463,6 +484,13 @@ def run_als_regression(
     
     coefficients_df.to_csv(coefficients_output, index=False)
     print(f"  系数文件: {coefficients_output}")
+    
+    # 保存迭代历史 CSV
+    if model.history:
+        history_output = str(output_prefix) + '_iteration_history.csv'
+        history_df = pd.DataFrame(model.history)
+        history_df.to_csv(history_output, index=False)
+        print(f"  迭代历史: {history_output}")
     
     # 8. 生成 Ta 栅格
     print("\n[8] 生成 Ta 栅格...")
@@ -601,10 +629,12 @@ def main(args=None):
                             help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
         parser.add_argument('--x-c', type=str, default=None,
                             help='分类特征列名（将进行one-hot编码），逗号分隔')
-        parser.add_argument('--max-iter', type=int, default=20,
+        parser.add_argument('--max-iter', type=int, default=100,
                             help='ALS最大迭代次数')
         parser.add_argument('--tol', type=float, default=1e-4,
                             help='收敛容差')
+        parser.add_argument('--ridge-alpha', type=float, default=0.0,
+                            help='岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）')
         parser.add_argument('--quiet', action='store_true',
                             help='静默模式')
         args = parser.parse_args()
@@ -636,6 +666,8 @@ def main(args=None):
         print(f"  储热特征（连续）: {X_S_columns}")
     if X_C_columns:
         print(f"  分类特征（one-hot编码）: {X_C_columns}")
+    if args.ridge_alpha > 0:
+        print(f"  岭回归正则化参数: {args.ridge_alpha:.2e}")
 
     try:
         run_als_regression(
@@ -649,6 +681,7 @@ def main(args=None):
             X_C_columns=X_C_columns,
             max_iter=args.max_iter,
             tol=args.tol,
+            ridge_alpha=args.ridge_alpha,
             verbose=not args.quiet
         )
         

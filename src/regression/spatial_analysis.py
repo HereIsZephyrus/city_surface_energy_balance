@@ -19,11 +19,15 @@
     - ε: 残差
 """
 
+import hashlib
+import pickle
+from pathlib import Path
+from typing import Dict, Optional, Union
+
 import numpy as np
 import geopandas as gpd
-from typing import Dict
 from scipy.stats import norm
-from scipy.sparse import csr_matrix, lil_matrix, diags
+from scipy.sparse import csr_matrix, lil_matrix, diags, save_npz, load_npz
 from shapely.strtree import STRtree
 
 
@@ -41,14 +45,22 @@ class SpatialWeightMatrix:
         - linear: 线性衰减（1 - d/threshold）
         - inverse: 反比衰减（1/d）
         - gaussian: 高斯衰减（exp(-d²/2σ²)）
+    
+    缓存支持:
+        使用 cache_dir 参数可以将计算好的权重矩阵保存到磁盘，
+        下次使用相同参数时可以直接从缓存加载，避免重复计算。
     """
+    
+    CACHE_METADATA_FILE = 'spatial_weights_metadata.pkl'
+    CACHE_MATRIX_FILE = 'spatial_weights_matrix.npz'
     
     def __init__(
         self,
         districts_gdf: gpd.GeoDataFrame,
         distance_threshold: float = 5000.0,
         decay_function: str = 'binary',
-        row_standardize: bool = True
+        row_standardize: bool = True,
+        cache_dir: Optional[Union[str, Path]] = None
     ):
         """
         构建空间权重矩阵（稀疏矩阵版本）
@@ -58,17 +70,133 @@ class SpatialWeightMatrix:
             distance_threshold: 距离阈值（米），边界距离小于此值视为邻居
             decay_function: 距离衰减函数 ('binary', 'linear', 'inverse', 'gaussian')
             row_standardize: 是否行标准化（每行权重和为1）
+            cache_dir: 缓存目录路径（如果提供，会尝试从缓存加载或保存到缓存）
         """
         self.n = len(districts_gdf)
         self.distance_threshold = distance_threshold
         self.decay_function = decay_function
         self.row_standardize = row_standardize
+        self._cache_dir = Path(cache_dir) if cache_dir else None
         
-        # 使用稀疏矩阵和空间索引构建权重矩阵（内存高效）
-        self.W = self._build_sparse_weight_matrix(districts_gdf)
+        # 计算几何哈希，用于验证缓存有效性
+        self._geometry_hash = self._compute_geometry_hash(districts_gdf)
         
-        # 计算邻居统计
-        self.neighbor_counts = np.array(self.W.sum(axis=1)).flatten()
+        # 尝试从缓存加载
+        if self._cache_dir and self._try_load_from_cache():
+            print(f"  ✓ 从缓存加载空间权重矩阵: {self._cache_dir}")
+        else:
+            # 使用稀疏矩阵和空间索引构建权重矩阵（内存高效）
+            self.W = self._build_sparse_weight_matrix(districts_gdf)
+            # 计算邻居统计
+            self.neighbor_counts = np.array(self.W.sum(axis=1)).flatten()
+            # 保存到缓存
+            if self._cache_dir:
+                self.save_to_cache()
+    
+    @staticmethod
+    def _compute_geometry_hash(gdf: gpd.GeoDataFrame) -> str:
+        """
+        计算 GeoDataFrame 几何的哈希值，用于验证缓存有效性
+        
+        基于几何的 WKB 表示和数量计算哈希
+        """
+        # 使用前10个、中间10个和最后10个几何的 WKB 作为采样
+        n = len(gdf)
+        indices = []
+        if n <= 30:
+            indices = list(range(n))
+        else:
+            indices = list(range(10)) + list(range(n//2 - 5, n//2 + 5)) + list(range(n-10, n))
+        
+        hash_data = f"n={n};"
+        for i in indices:
+            geom = gdf.geometry.iloc[i]
+            if geom is not None:
+                # 使用几何的 bounds 和 area 作为快速哈希
+                bounds = geom.bounds
+                area = geom.area
+                hash_data += f"{i}:{bounds}:{area:.6f};"
+        
+        return hashlib.md5(hash_data.encode()).hexdigest()[:16]
+    
+    def _get_cache_key(self) -> Dict:
+        """获取缓存键（用于验证缓存有效性）"""
+        return {
+            'n': self.n,
+            'distance_threshold': self.distance_threshold,
+            'decay_function': self.decay_function,
+            'row_standardize': self.row_standardize,
+            'geometry_hash': self._geometry_hash
+        }
+    
+    def _try_load_from_cache(self) -> bool:
+        """
+        尝试从缓存加载权重矩阵
+        
+        返回:
+            bool: 是否成功从缓存加载
+        """
+        if not self._cache_dir:
+            return False
+        
+        metadata_path = self._cache_dir / self.CACHE_METADATA_FILE
+        matrix_path = self._cache_dir / self.CACHE_MATRIX_FILE
+        
+        if not metadata_path.exists() or not matrix_path.exists():
+            return False
+        
+        try:
+            # 加载元数据
+            with open(metadata_path, 'rb') as f:
+                cached_metadata = pickle.load(f)
+            
+            # 验证缓存有效性
+            current_key = self._get_cache_key()
+            if cached_metadata.get('cache_key') != current_key:
+                print(f"  缓存参数不匹配，将重新计算...")
+                return False
+            
+            # 加载稀疏矩阵
+            self.W = load_npz(matrix_path)
+            self.neighbor_counts = cached_metadata['neighbor_counts']
+            
+            return True
+            
+        except Exception as e:
+            print(f"  缓存加载失败: {e}，将重新计算...")
+            return False
+    
+    def save_to_cache(self) -> None:
+        """保存权重矩阵到缓存"""
+        if not self._cache_dir:
+            return
+        
+        self._cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        metadata_path = self._cache_dir / self.CACHE_METADATA_FILE
+        matrix_path = self._cache_dir / self.CACHE_MATRIX_FILE
+        
+        # 保存元数据
+        metadata = {
+            'cache_key': self._get_cache_key(),
+            'neighbor_counts': self.neighbor_counts
+        }
+        with open(metadata_path, 'wb') as f:
+            pickle.dump(metadata, f)
+        
+        # 保存稀疏矩阵
+        save_npz(matrix_path, self.W)
+        
+        print(f"  ✓ 空间权重矩阵已缓存: {self._cache_dir}")
+    
+    @classmethod
+    def cache_exists(cls, cache_dir: Union[str, Path]) -> bool:
+        """检查缓存是否存在"""
+        cache_dir = Path(cache_dir)
+        return (
+            (cache_dir / cls.CACHE_METADATA_FILE).exists() and
+            (cache_dir / cls.CACHE_MATRIX_FILE).exists()
+        )
     
     def _build_sparse_weight_matrix(self, districts_gdf: gpd.GeoDataFrame) -> csr_matrix:
         """
