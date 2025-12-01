@@ -74,52 +74,61 @@ class SpatialWeightMatrix:
         """
         使用空间索引和稀疏矩阵构建权重矩阵（内存高效）
         
-        只计算和存储距离小于阈值的邻居关系，避免存储完整的距离矩阵。
+        使用 STRtree 的 dwithin 谓词直接查询距离内的邻居，
+        避免创建缓冲区，大幅提升效率。
         """
         print(f"  构建空间权重矩阵（稀疏矩阵，n={self.n}）...")
         
-        # 使用 STRtree 空间索引快速查找潜在邻居
+        # 使用 STRtree 空间索引
         geometries = districts_gdf.geometry.values
         tree = STRtree(geometries)
         
-        # 为每个几何体创建缓冲区，用于查询
-        # 使用距离阈值作为缓冲区半径
-        buffered_geoms = [geom.buffer(self.distance_threshold) for geom in geometries]
+        # 使用 dwithin 谓词批量查询距离内的所有邻居对
+        # 返回 (left_indices, right_indices)，表示 geometries[left] 与 geometries[right] 距离 < threshold
+        print(f"    使用 dwithin 谓词查询邻居（距离阈值: {self.distance_threshold}m）...")
+        left_indices, right_indices = tree.query(
+            geometries, 
+            predicate='dwithin', 
+            distance=self.distance_threshold
+        )
         
-        # 使用稀疏矩阵（LIL格式便于逐行构建）
+        # 过滤掉自身（i == j 的情况）
+        mask = left_indices != right_indices
+        left_indices = left_indices[mask]
+        right_indices = right_indices[mask]
+        
+        print(f"    找到 {len(left_indices)} 对邻居关系")
+        
+        # 使用稀疏矩阵（LIL格式便于逐元素构建）
         W = lil_matrix((self.n, self.n), dtype=np.float64)
         
-        # 逐行构建权重矩阵
-        for i in range(self.n):
-            if (i + 1) % 10000 == 0:
-                print(f"    处理进度: {i+1}/{self.n} ({100*(i+1)/self.n:.1f}%)")
+        # 根据衰减函数计算权重
+        if self.decay_function == 'binary':
+            # 二值权重，无需计算距离
+            for i, j in zip(left_indices, right_indices):
+                W[i, j] = 1.0
+        else:
+            # 需要计算精确距离来确定权重
+            print(f"    计算精确距离并应用 {self.decay_function} 衰减函数...")
+            sigma = self.distance_threshold / 3  # 用于 gaussian 衰减
             
-            # 使用空间索引查找潜在邻居
-            potential_neighbors = tree.query(buffered_geoms[i])
-            
-            for j in potential_neighbors:
-                if i == j:
-                    continue  # 跳过自己
+            for idx, (i, j) in enumerate(zip(left_indices, right_indices)):
+                if (idx + 1) % 100000 == 0:
+                    print(f"      进度: {idx+1}/{len(left_indices)} ({100*(idx+1)/len(left_indices):.1f}%)")
                 
-                # 计算实际距离
                 dist = geometries[i].distance(geometries[j])
                 
-                if dist < self.distance_threshold:
-                    # 根据衰减函数计算权重
-                    if self.decay_function == 'binary':
-                        weight = 1.0
-                    elif self.decay_function == 'linear':
-                        weight = 1.0 - dist / self.distance_threshold
-                    elif self.decay_function == 'inverse':
-                        weight = 1.0 / max(dist, 1.0)
-                    elif self.decay_function == 'gaussian':
-                        sigma = self.distance_threshold / 3  # 3σ 约等于阈值
-                        weight = np.exp(-dist**2 / (2 * sigma**2))
-                    else:
-                        weight = 0.0
-                    
-                    if weight > 0:
-                        W[i, j] = weight
+                if self.decay_function == 'linear':
+                    weight = 1.0 - dist / self.distance_threshold
+                elif self.decay_function == 'inverse':
+                    weight = 1.0 / max(dist, 1.0)
+                elif self.decay_function == 'gaussian':
+                    weight = np.exp(-dist**2 / (2 * sigma**2))
+                else:
+                    weight = 0.0
+                
+                if weight > 0:
+                    W[i, j] = weight
         
         # 转换为 CSR 格式（更高效的矩阵运算）
         W = W.tocsr()

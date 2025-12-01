@@ -170,36 +170,3 @@ def calculate_surface_resistance(
 
     return rs.astype(np.float32)
 
-
-def estimate_roughness_length_from_buildings(
-        building_height: np.ndarray,
-        building_density: np.ndarray
-) -> np.ndarray:
-    """
-    根据建筑高度和密度估算地表粗糙度
-
-    城市粗糙度参数化方案：
-        z0 ≈ 0.1 × H × λp
-
-    其中:
-        H: 平均建筑高度
-        λp: 建筑平面面积比
-
-    参数:
-        building_height: 平均建筑高度 (m) - ndarray
-        building_density: 建筑密度/面积比 (0-1) - ndarray
-
-    返回:
-        粗糙度长度 z0 (m) - ndarray
-
-    参考:
-        Grimmond & Oke, 1999
-    """
-    # 简化的参数化方案
-    z0 = 0.1 * building_height * building_density
-
-    # 限制在合理范围 (0.01m - 5m)
-    z0 = np.clip(z0, 0.01, 5.0)
-
-    return z0.astype(np.float32)
-

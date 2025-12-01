@@ -36,6 +36,7 @@ def calculate_energy_balance(
     std_meridian: float = 120.0,
     verbose: bool = True,
     cache_dir: Optional[str] = None,
+    tif_path: Optional[str] = None,
     restart: bool = False
 ) -> Union[RasterCollection, CachedRasterCollection]:
     """

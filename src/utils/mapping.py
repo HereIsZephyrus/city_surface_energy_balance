@@ -36,8 +36,7 @@ LANDSAT_BANDS: Dict[str, int] = {
     'ndvi': 9,        # 归一化植被指数
     'fvc': 10,        # 植被覆盖度
     'lst': 19,        # K - 地表温度
-    'albedo': 11,     # 反照率
-    'emissivity': 12  # 地表发射率
+    'emissivity': 14  # 地表发射率
 }
 
 

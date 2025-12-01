@@ -532,6 +532,7 @@ def calculate_cluster_roughness(
     计算单个建筑群的粗糙度参数
     
     使用扫描线法计算有效迎风面积（考虑遮挡），然后计算粗糙度参数。
+    建筑高度使用矢量数据中的 height 字段。
     
     参数:
         group: 建筑群的 GeoDataFrame（已按 district + cluster 分组）
@@ -551,7 +552,7 @@ def calculate_cluster_roughness(
     if len(group) == 0:
         return None
     
-    # 提取该建筑群的数据
+    # 提取该建筑群的数据（使用矢量数据中的height字段）
     heights = group[height_field].values.astype(np.float64)
     footprints = group[footprint_field].values.astype(np.float64)
     block_areas = group[block_area_field].values.astype(np.float64)
@@ -608,18 +609,23 @@ def calculate_cluster_roughness(
 def calculate_roughness_from_buildings(
     building_path: str,
     collection,
+    voronoi_diagram_path: str,
     height_field: str = 'height',
     footprint_field: str = 'area',
     block_area_field: str = 'voroniarea',
     min_proj_field: str = 'min_proj',
     max_proj_field: str = 'max_proj',
     district_field: str = 'district_id',
-    cluster_field: str = 'spectral_cluster'
+    cluster_field: str = 'spectral_cluster',
+    building_id_field: str = 'id'
 ) -> tuple:
     """
     从建筑 gpkg 数据计算粗糙度长度和零平面位移高度
     
     使用扫描线法按建筑群计算有效迎风面积（考虑遮挡），然后计算粗糙度参数。
+    建筑高度使用矢量数据中的 height 字段。
+    将结果连接到 voronoi 图并栅格化整个面。
+    displacement_height 使用 building_height 栅格计算。
     
     基于 Bottema & Mestayer (1998) 方法:
         z_d = h × λ_p^0.6
@@ -627,7 +633,8 @@ def calculate_roughness_from_buildings(
     
     参数:
         building_path: 建筑数据文件路径 (.gpkg)
-        collection: 栅格集合（用于获取目标范围和分辨率）
+        collection: 栅格集合（用于获取目标范围和分辨率，以及building_height栅格）
+        voronoi_diagram_path: Voronoi图文件路径 (.gpkg，必需，id与building的id对应)
         height_field: 建筑高度字段名
         footprint_field: 建筑平面面积字段名
         block_area_field: 维诺图面积字段名
@@ -635,11 +642,13 @@ def calculate_roughness_from_buildings(
         max_proj_field: 沿风向投影最大点字段名
         district_field: 街区ID字段名
         cluster_field: 建筑群聚类标签字段名
+        building_id_field: 建筑ID字段名（用于与voronoi图匹配）
     
     返回:
-        (z_0_raster, z_d_raster, height_raster): 粗糙度长度、零平面位移高度、建筑高度栅格
+        (z_0_raster, z_d_raster): 粗糙度长度、零平面位移高度栅格
     """
     from rasterio.transform import rowcol
+    from rasterio.features import rasterize
     
     print("\n从建筑数据计算粗糙度参数（按建筑群聚合，扫描线法）...")
     print(f"  文件: {building_path}")
@@ -679,21 +688,36 @@ def calculate_roughness_from_buildings(
         print(f"  过滤无效建筑: {filtered_count} 栋")
     print(f"  有效建筑数量: {len(buildings)} 栋")
     
+    # 读取 Voronoi 图
+    print(f"\n读取 Voronoi 图: {voronoi_diagram_path}")
+    voronoi = gpd.read_file(voronoi_diagram_path)
+    print(f"  Voronoi 要素数量: {len(voronoi)}")
+    
+    # 确保坐标系一致
+    if voronoi.crs != target_crs:
+        voronoi = voronoi.to_crs(target_crs)
+    
+    # 验证 voronoi 图有 id 字段
+    if building_id_field not in voronoi.columns:
+        raise ValueError(f"Voronoi图缺少必需字段: {building_id_field}")
+    
+    # 获取 building_height 栅格
+    building_height_raster = collection.get_array('building_height')
+    
     # 获取目标栅格信息
     ref_info = collection._reference_info
     shape = (ref_info['height'], ref_info['width'])
     transform = ref_info['transform']
-    
-    # 初始化输出栅格
-    z_0_raster = np.full(shape, np.nan, dtype=np.float32)
-    z_d_raster = np.full(shape, np.nan, dtype=np.float32)
-    height_raster = np.full(shape, np.nan, dtype=np.float32)
     
     # 按建筑群分组计算
     grouped = buildings.groupby([district_field, cluster_field])
     cluster_count = 0
     
     print(f"  建筑群数量: {len(grouped)}")
+    
+    # 存储每个建筑群的计算结果
+    cluster_results = {}  # {(district_id, cluster_id): (z_0, z_d)}
+    building_to_cluster = {}  # {building_id: (district_id, cluster_id)}
     
     for (district_id, cluster_id), group in grouped:
         # 使用抽象的计算函数
@@ -711,29 +735,145 @@ def calculate_roughness_from_buildings(
         if result is None:
             continue
         
-        # 将该建筑群的粗糙度写入所有建筑所在的像元
-        centroids = group.geometry.centroid
-        for centroid in centroids:
-            try:
-                row, col = rowcol(transform, centroid.x, centroid.y)
-                if 0 <= row < shape[0] and 0 <= col < shape[1]:
-                    # 如果该位置已有值，取较大值（更保守）
-                    if np.isnan(z_0_raster[row, col]) or result.z_0 > z_0_raster[row, col]:
-                        z_0_raster[row, col] = result.z_0
-                        z_d_raster[row, col] = result.z_d
-                        height_raster[row, col] = result.h_weighted
-            except Exception:
-                continue
+        cluster_results[(district_id, cluster_id)] = (result.z_0, result.z_d)
+        
+        # 记录每个建筑所属的 cluster
+        if building_id_field in group.columns:
+            for building_id in group[building_id_field]:
+                building_to_cluster[building_id] = (district_id, cluster_id)
         
         cluster_count += 1
     
     print(f"  处理建筑群: {cluster_count}")
     
+    # 将计算结果连接到 Voronoi 图
+    print("\n将计算结果连接到 Voronoi 图...")
+    voronoi['z_0'] = np.nan
+    voronoi['z_d'] = np.nan
+    
+    matched_count = 0
+    for idx, row in voronoi.iterrows():
+        building_id = row[building_id_field]
+        if building_id in building_to_cluster:
+            district_id, cluster_id = building_to_cluster[building_id]
+            if (district_id, cluster_id) in cluster_results:
+                z_0, z_d = cluster_results[(district_id, cluster_id)]
+                voronoi.at[idx, 'z_0'] = z_0
+                voronoi.at[idx, 'z_d'] = z_d
+                matched_count += 1
+    
+    print(f"  匹配的 Voronoi 要素: {matched_count} / {len(voronoi)}")
+    
+    # 对于每个 Voronoi 要素，使用 building_height 栅格计算 displacement_height
+    print("\n使用 building_height 栅格计算 displacement_height...")
+    from .roughness import calculate_zero_plane_displacement
+    
+    # 只处理有粗糙度值的要素
+    valid_voronoi = voronoi[voronoi['z_0'].notna()].copy()
+    
+    if len(valid_voronoi) > 0:
+        try:
+            from rasterstats import zonal_stats
+            
+            # 批量计算所有 Voronoi 要素的平均 building_height
+            print(f"  批量处理 {len(valid_voronoi)} 个 Voronoi 要素...")
+            zs = zonal_stats(
+                valid_voronoi.geometry,
+                building_height_raster,
+                affine=transform,
+                stats=['mean'],
+                nodata=np.nan,
+                all_touched=True
+            )
+            
+            # 更新 z_d 值
+            lambda_p_approx = 0.5
+            updated_count = 0
+            for idx, stats_dict in zip(valid_voronoi.index, zs):
+                mean_height = stats_dict.get('mean')
+                if mean_height is not None and np.isfinite(mean_height) and mean_height > 0:
+                    z_d_new = calculate_zero_plane_displacement(mean_height, lambda_p_approx)
+                    voronoi.at[idx, 'z_d'] = z_d_new
+                    updated_count += 1
+            
+            print(f"  更新了 {updated_count} 个 Voronoi 要素的 z_d 值")
+            
+        except ImportError:
+            # 如果 rasterstats 不可用，使用备用方法（geometry_mask）
+            print("  rasterstats 不可用，使用备用方法...")
+            from rasterio import features
+            
+            lambda_p_approx = 0.5
+            updated_count = 0
+            
+            for idx, row in valid_voronoi.iterrows():
+                geom = row.geometry
+                if geom is None or geom.is_empty:
+                    continue
+                
+                try:
+                    # 创建该几何体的掩膜
+                    mask = features.geometry_mask(
+                        [geom],
+                        transform=transform,
+                        out_shape=shape,
+                        invert=True  # True 表示几何体内为 True
+                    )
+                    
+                    # 提取掩膜区域的值
+                    masked_data = building_height_raster[mask]
+                    valid_heights = masked_data[np.isfinite(masked_data) & (masked_data > 0)]
+                    
+                    if len(valid_heights) > 0:
+                        mean_height = np.mean(valid_heights)
+                        z_d_new = calculate_zero_plane_displacement(mean_height, lambda_p_approx)
+                        voronoi.at[idx, 'z_d'] = z_d_new
+                        updated_count += 1
+                except Exception:
+                    # 如果处理失败，保持原始计算的 z_d
+                    continue
+            
+            print(f"  更新了 {updated_count} 个 Voronoi 要素的 z_d 值")
+    
+    # 栅格化 Voronoi 图
+    print("\n栅格化 Voronoi 图...")
+    
+    # 准备栅格化数据
+    z_0_shapes = [
+        (geom, value) 
+        for geom, value in zip(voronoi.geometry, voronoi['z_0'])
+        if geom is not None and not geom.is_empty and not pd.isna(value)
+    ]
+    
+    z_d_shapes = [
+        (geom, value) 
+        for geom, value in zip(voronoi.geometry, voronoi['z_d'])
+        if geom is not None and not geom.is_empty and not pd.isna(value)
+    ]
+    
+    # 执行栅格化
+    z_0_raster = rasterize(
+        shapes=z_0_shapes,
+        out_shape=shape,
+        transform=transform,
+        fill=np.nan,
+        dtype=np.float32,
+        all_touched=True
+    )
+    
+    z_d_raster = rasterize(
+        shapes=z_d_shapes,
+        out_shape=shape,
+        transform=transform,
+        fill=np.nan,
+        dtype=np.float32,
+        all_touched=True
+    )
+    
     # 对于没有建筑的区域，使用默认值
     nan_mask = np.isnan(z_0_raster)
     z_0_raster[nan_mask] = 0.1  # 默认粗糙度 0.1m
     z_d_raster[nan_mask] = 0.0  # 默认位移高度 0m
-    height_raster[nan_mask] = 0.0
     
     # 限制在合理范围
     z_0_raster = np.clip(z_0_raster, 0.0001, 5.0)
@@ -742,4 +882,4 @@ def calculate_roughness_from_buildings(
     print(f"  z_0 范围: {np.nanmin(z_0_raster):.4f} - {np.nanmax(z_0_raster):.4f} m")
     print(f"  z_d 范围: {np.nanmin(z_d_raster):.2f} - {np.nanmax(z_d_raster):.2f} m")
     
-    return z_0_raster, z_d_raster, height_raster
+    return z_0_raster, z_d_raster

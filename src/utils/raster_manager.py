@@ -684,91 +684,104 @@ class RasterCollection:
                 return res
         raise KeyError(f"没有找到前缀为'{prefix}'的栅格。可用: {list(self.original_resolutions.keys())}")
 
-    def save_multiband(
-        self,
-        output_path: Union[str, Path],
-        bands: List[Tuple[str, np.ndarray]],
-        compress: str = 'lzw',
-        dtype: type = np.float32
-    ) -> None:
-        """
-        保存多个波段到单个GeoTIFF文件
-
-        参数:
-            output_path: 输出文件路径
-            bands: [(波段名, 数组), ...] 列表，每个元素是(名称, 2D数组)
-            compress: 压缩方法（默认 'lzw'）
-            dtype: 输出数据类型（默认 np.float32）
-        """
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # 获取参考地理信息
-        ref_info = self.get_reference_info()
-
-        expected_shape = (ref_info['height'], ref_info['width'])
-
-        with rasterio.open(
-            output_path, 'w',
-            driver='GTiff',
-            height=ref_info['height'],
-            width=ref_info['width'],
-            count=len(bands),
-            dtype=dtype,
-            crs=ref_info['crs'],
-            transform=ref_info['transform'],
-            nodata=np.nan,
-            compress=compress
-        ) as dst:
-            for i, (name, arr) in enumerate(bands, 1):
-                # 确保是2D数组
-                if arr.ndim == 3:
-                    arr = arr[0, :, :]
-                
-                # 尺寸检查
-                if arr.shape != expected_shape:
-                    raise ValueError(
-                        f"波段 '{name}' 尺寸不匹配！"
-                        f"期望 {expected_shape}，实际 {arr.shape}"
-                    )
-                
-                dst.write(arr.astype(dtype), i)
-                dst.set_band_description(i, name)
-
-        print(f"✓ 已保存: {output_path}")
-        print(f"  波段数: {len(bands)}")
-
     def save(
         self,
-        output_dir: Union[str, Path],
+        output_path: Union[str, Path],
         driver: str = 'GTiff',
-        compress: str = 'lzw'
+        compress: str = 'lzw',
+        output_bands: Optional[List[str]] = None
     ) -> None:
         """
-        保存对齐后的栅格到文件
+        保存对齐后的栅格到单个多波段GeoTIFF文件
 
         注意: 所有栅格在 add_raster 时已自动对齐，直接保存即可
 
         参数:
-            output_dir: 输出目录
+            output_path: 输出文件路径
             driver: 输出格式驱动（默认GeoTIFF）
             compress: 压缩方法
+            output_bands: 要保存的波段名称列表（如果为None，保存所有波段）
         """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        print("\n" + "=" * 60)
+        print(f"保存结果: {output_path}")
+        print("=" * 60)
+
+        # 收集所有有效的 DataArray
+        valid_rasters = {}
         for name, da in self.rasters.items():
-            output_path = output_dir / f"{name}_aligned.tif"
-
-            # 使用rioxarray保存
+            # 如果指定了 output_bands，只处理列表中的波段
+            if output_bands is not None and name not in output_bands:
+                continue
+                
             if hasattr(da, 'rio'):
-                da.rio.to_raster(
-                    output_path,
-                    driver=driver,
-                    compress=compress
-                )
+                valid_rasters[name] = da
             else:
                 warnings.warn(f"栅格'{name}'没有空间参考信息，跳过保存")
+
+        if not valid_rasters:
+            if output_bands is not None:
+                available = list(self.rasters.keys())
+                missing = [b for b in output_bands if b not in available]
+                if missing:
+                    raise ValueError(
+                        f"指定的波段不存在: {missing}。可用波段: {available}"
+                    )
+            raise ValueError("没有有效的栅格数据可保存")
+
+        # 创建 xarray Dataset，将所有波段合并
+        # 创建数据变量字典
+        data_vars = {}
+        ref_da = None
+        
+        # 如果指定了 output_bands，按照指定顺序处理；否则按照字典顺序
+        band_order = output_bands if output_bands is not None else list(valid_rasters.keys())
+        
+        for name in band_order:
+            if name not in valid_rasters:
+                continue  # 跳过不存在的波段
+            da = valid_rasters[name]
+            # 确保是2D数组
+            if da.ndim == 3:
+                da = da.isel(band=0) if 'band' in da.dims else da[0]
+            data_vars[name] = da
+            # 保存第一个 DataArray 作为参考（用于获取地理信息）
+            if ref_da is None:
+                ref_da = da
+
+        # 创建 Dataset
+        ds = xr.Dataset(data_vars)
+        
+        # 使用 rioxarray 保存为多波段 GeoTIFF
+        # 需要将 Dataset 转换为 DataArray 的堆叠形式
+        # 使用 to_array() 方法将 Dataset 转换为多波段 DataArray
+        ds_array = ds.to_array(dim='band')
+        
+        # 设置波段名称（按照指定顺序）
+        ds_array['band'] = [name for name in band_order if name in valid_rasters]
+        
+        # 确保地理信息正确传递（从参考 DataArray 复制）
+        if ref_da is not None and hasattr(ref_da, 'rio'):
+            ds_array = ds_array.rio.write_crs(ref_da.rio.crs)
+            ds_array = ds_array.rio.write_transform(ref_da.rio.transform())
+        
+        # 保存为多波段 GeoTIFF
+        ds_array.rio.to_raster(
+            output_path,
+            driver=driver,
+            compress=compress,
+            nodata=np.nan
+        )
+
+        # 打印波段列表
+        saved_bands = [name for name in band_order if name in valid_rasters]
+        print(f"✓ 已保存: {output_path}")
+        print(f"  波段数: {len(saved_bands)}")
+        print(f"  保存了 {len(saved_bands)} 个波段:")
+        for i, name in enumerate(saved_bands, 1):
+            print(f"    {i:2d}. {name}")
 
     def add_array(self, name: str, array: np.ndarray) -> None:
         """
