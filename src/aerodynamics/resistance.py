@@ -195,101 +195,86 @@ def calculate_aerodynamic_resistance(
 
 def calculate_surface_resistance(
         ndvi: np.ndarray,
-        lai: Optional[np.ndarray] = None,
-        soil_moisture: Optional[np.ndarray] = None,
-        land_cover_type: Optional[np.ndarray] = None
+        lcz: np.ndarray
 ) -> np.ndarray:
     """
     计算表面阻抗 rs (s/m)
 
     表面阻抗反映植被气孔阻力和土壤蒸发阻力。
 
-    基于Penman-Monteith方程的参数化:
-        rs = rs_min / LAI × f1(Ta) / [f2(VPD) × f3(ψ)]
-
-    简化方案（基于NDVI）:
-        - 高植被覆盖: rs较小（易蒸腾）
-        - 裸地/不透水面: rs较大（难蒸发）
+    基于LCZ类型的参数化方案:
+        - 不透水面 (LCZ 1-10): rs很大（难蒸发）
+        - 植被 (LCZ 11-12): rs较小（易蒸腾）
+        - 裸土 (LCZ 13): rs中等
+        - 水体 (LCZ 14): rs很大（水面蒸发阻力）
 
     参数:
         ndvi: 归一化植被指数 - ndarray, 范围-1到1
-        lai: 叶面积指数 - ndarray, 可选
-        soil_moisture: 土壤湿度 - ndarray, 可选
-        land_cover_type: 土地覆盖类型 - ndarray, 可选
+        lcz: LCZ分类 (1-14) - ndarray
 
     返回:
         表面阻抗 rs (s/m) - ndarray
 
     注意:
-        - 不透水面 rs → 无穷大（实际取很大值）
-        - 植被茂盛 rs → 最小气孔阻力
-        - 需要考虑土壤水分影响
-
-    TODO:
-        完整实现需要:
-        1. LAI数据（遥感反演或查找表）
-        2. 土壤水分数据（ERA5-Land或遥感估算）
-        3. 详细的土地覆盖分类
-        4. 不同植被类型的参数化方案
+        - 不透水面 rs → 很大值（实际取1000 s/m）
+        - 植被茂盛 rs → 最小气孔阻力（50-100 s/m）
+        - 稀疏建筑区根据NDVI调整
     """
-    # 这是一个基于NDVI的简化实现
-
-    # NDVI阈值
-    ndvi_min = 0.0  # 裸地阈值
-    ndvi_max = 0.8  # 高植被阈值
-
-    # 归一化NDVI (0-1)
-    ndvi_norm = np.clip((ndvi - ndvi_min) / (ndvi_max - ndvi_min), 0.0, 1.0)
-
-    # 基于NDVI的线性插值
-    # 高植被: rs ≈ 50 s/m
-    # 裸地/不透水面: rs ≈ 500 s/m
-    rs_min = 50.0
-    rs_max = 500.0
-
-    rs = rs_max - ndvi_norm * (rs_max - rs_min)
-
-    # 如果提供了土壤湿度，进行修正
-    if soil_moisture is not None:
-        # 干燥土壤增大阻抗
-        moisture_factor = np.clip(soil_moisture, 0.1, 1.0)
-        rs = rs / moisture_factor
-
-    # 限制在合理范围
-    rs = np.clip(rs, 30.0, 1000.0)
-
+    # 处理 LCZ 中的 NaN 值
+    lcz_safe = np.where(np.isfinite(lcz), lcz, 0).astype(int)
+    
+    # 初始化结果数组
+    rs = np.full_like(ndvi, np.nan, dtype=np.float32)
+    
+    # === 情况1: 不透水面 (LCZ 1-10，除了稀疏建筑) ===
+    # 城市建筑类型 (1-8) 和铺装地表 (10)
+    impervious_mask = ((lcz_safe >= 1) & (lcz_safe <= 8)) | (lcz_safe == _LCZ_BARE_ROCK)
+    rs[impervious_mask] = 1000.0  # 不透水面，几乎不蒸发
+    
+    # === 情况2: 稀疏建筑 (LCZ 9) ===
+    # 稀疏建筑区有较多自然地表，根据NDVI调整
+    sparse_mask = (lcz_safe == 9)
+    if np.any(sparse_mask):
+        ndvi_min = 0.0
+        ndvi_max = 0.8
+        ndvi_norm = np.clip((ndvi[sparse_mask] - ndvi_min) / (ndvi_max - ndvi_min), 0.0, 1.0)
+        # 稀疏建筑区: 200-800 s/m，根据NDVI调整
+        rs_sparse = 800.0 - ndvi_norm * 600.0
+        rs[sparse_mask] = rs_sparse
+    
+    # === 情况3: 植被 (LCZ 11-12) ===
+    # 密集树木和灌木/低矮植被，根据NDVI调整
+    veg_mask = (lcz_safe == _LCZ_DENSE_TREES) | (lcz_safe == _LCZ_BUSH_GRASS)
+    if np.any(veg_mask):
+        ndvi_min = 0.0
+        ndvi_max = 0.8
+        ndvi_norm = np.clip((ndvi[veg_mask] - ndvi_min) / (ndvi_max - ndvi_min), 0.0, 1.0)
+        # 植被: 50-150 s/m，根据NDVI调整
+        # 高NDVI（茂盛植被）: rs ≈ 50 s/m
+        # 低NDVI（稀疏植被）: rs ≈ 150 s/m
+        rs_veg = 150.0 - ndvi_norm * 100.0
+        rs[veg_mask] = rs_veg
+    
+    # === 情况4: 裸土/沙地 (LCZ 13) ===
+    # 裸土，根据NDVI微调（可能有少量植被）
+    bare_soil_mask = (lcz_safe == _LCZ_BARE_SOIL)
+    if np.any(bare_soil_mask):
+        ndvi_min = 0.0
+        ndvi_max = 0.5  # 裸土NDVI通常较低
+        ndvi_norm = np.clip((ndvi[bare_soil_mask] - ndvi_min) / (ndvi_max - ndvi_min), 0.0, 1.0)
+        # 裸土: 300-500 s/m
+        rs_soil = 500.0 - ndvi_norm * 200.0
+        rs[bare_soil_mask] = rs_soil
+    
+    # === 情况5: 水体 (LCZ 14) ===
+    # 水体表面阻抗很大（水面蒸发阻力）
+    water_mask = (lcz_safe == _LCZ_WATER)
+    rs[water_mask] = 1000.0  # 水体，蒸发阻力大
+    
+    # 限制在合理范围 (30-1000 s/m)
+    # 注意：保持 NaN 值不变（无效 LCZ 区域）
+    valid_mask = np.isfinite(rs)
+    rs[valid_mask] = np.clip(rs[valid_mask], 30.0, 1000.0)
+    
     return rs.astype(np.float32)
-
-
-def estimate_roughness_length_from_buildings(
-        building_height: np.ndarray,
-        building_density: np.ndarray
-) -> np.ndarray:
-    """
-    根据建筑高度和密度估算地表粗糙度
-
-    城市粗糙度参数化方案：
-        z0 ≈ 0.1 × H × λp
-
-    其中:
-        H: 平均建筑高度
-        λp: 建筑平面面积比
-
-    参数:
-        building_height: 平均建筑高度 (m) - ndarray
-        building_density: 建筑密度/面积比 (0-1) - ndarray
-
-    返回:
-        粗糙度长度 z0 (m) - ndarray
-
-    参考:
-        Grimmond & Oke, 1999
-    """
-    # 简化的参数化方案
-    z0 = 0.1 * building_height * building_density
-
-    # 限制在合理范围 (0.01m - 5m)
-    z0 = np.clip(z0, 0.01, 5.0)
-
-    return z0.astype(np.float32)
 

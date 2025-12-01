@@ -17,11 +17,11 @@ City Surface Energy Balance
     2. 参数计算: 使用 aerodynamics 模块计算空气动力学参数
     3. 系数计算: 使用 radiation.calculate_energy_balance_coefficients
     4. 空间聚合: 使用 regression.DistrictAggregator
-    5. 回归求解: 使用 regression.DistrictRegressionModel
+    5. 回归求解: 使用 regression.ALSRegression
 
 快速开始:
     >>> from src.radiation import calculate_energy_balance_coefficients
-    >>> from src.regression import DistrictAggregator, DistrictRegressionModel
+    >>> from src.regression import DistrictAggregator, ALSRegression
     >>> from src.utils import RasterCollection
 
     >>> # Step 1: 加载数据
@@ -37,8 +37,8 @@ City Surface Energy Balance
     >>> aggregated = aggregator.aggregate_rasters_to_districts(...)
 
     >>> # Step 4: 回归求解（每个街区一个Ta）
-    >>> model = DistrictRegressionModel()
-    >>> results = model.fit_als_regression(...)
+    >>> model = ALSRegression()
+    >>> results = model.fit(...)
 
 参考文献:
     doc/晴朗无风条件下城市生态空间对城市降温作用量化模型.md
@@ -63,7 +63,7 @@ from .radiation import (
 
 from .regression import (
     DistrictAggregator,
-    DistrictRegressionModel
+    ALSRegression
 )
 
 from .utils import (
@@ -88,7 +88,7 @@ __all__ = [
     'calculate_energy_balance_coefficients',
     'validate_energy_balance',
     'DistrictAggregator',
-    'DistrictRegressionModel',
+    'ALSRegression',
     'RasterCollection',
     'RasterData',
 ]

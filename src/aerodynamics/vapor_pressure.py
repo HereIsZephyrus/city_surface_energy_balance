@@ -17,6 +17,23 @@
 import numpy as np
 
 
+def _print_array_stats(name: str, array: np.ndarray) -> None:
+    """打印数组的基本统计量，方便排查异常值"""
+    if array.size == 0:
+        print(f"{name}: empty array")
+        return
+    finite_vals = array[np.isfinite(array)]
+    if finite_vals.size == 0:
+        print(f"{name}: all values are NaN or inf")
+        return
+    print(
+        f"{name}: min={finite_vals.min():.3f}, "
+        f"max={finite_vals.max():.3f}, "
+        f"mean={finite_vals.mean():.3f}, "
+        f"std={finite_vals.std():.3f}"
+    )
+
+
 def calculate_saturation_vapor_pressure(temperature: np.ndarray) -> np.ndarray:
     """
     计算饱和水汽压（Magnus公式）
@@ -33,12 +50,14 @@ def calculate_saturation_vapor_pressure(temperature: np.ndarray) -> np.ndarray:
         Magnus, 1844; Murray, 1967
     """
     # 转换为摄氏度
+    _print_array_stats("temperature_K", temperature)
     T_celsius = temperature - 273.15
+    _print_array_stats("temperature_C", T_celsius)
 
     # Magnus公式
     es = 0.6108 * np.exp(17.27 * T_celsius / (T_celsius + 237.3))
 
-    return es.astype(np.float32)
+    return es
 
 
 def calculate_actual_vapor_pressure(temperature: np.ndarray,
@@ -56,12 +75,13 @@ def calculate_actual_vapor_pressure(temperature: np.ndarray,
         实际水汽压 ea (kPa) - ndarray
     """
     # 先计算饱和水汽压
+    _print_array_stats("relative_humidity", relative_humidity)
     es = calculate_saturation_vapor_pressure(temperature)
 
     # 计算实际水汽压
     ea = relative_humidity * es / 100.0
 
-    return ea.astype(np.float32)
+    return ea
 
 
 def calculate_actual_vapor_pressure_from_dewpoint(
@@ -87,12 +107,14 @@ def calculate_actual_vapor_pressure_from_dewpoint(
         ERA5-Land band: 'dewpoint_temperature_2m' (K)
     """
     # 转换为摄氏度
+    _print_array_stats("dewpoint_temperature_K", dewpoint_temperature)
     Td_celsius = dewpoint_temperature - 273.15
+    _print_array_stats("dewpoint_temperature_C", Td_celsius)
 
     # Magnus公式计算实际水汽压
     ea = 0.6108 * np.exp(17.27 * Td_celsius / (Td_celsius + 237.3))
 
-    return ea.astype(np.float32)
+    return ea
 
 
 def calculate_vapor_pressure_deficit(temperature: np.ndarray,
@@ -112,12 +134,13 @@ def calculate_vapor_pressure_deficit(temperature: np.ndarray,
     注意:
         VPD 是植物蒸腾和表面阻抗的重要影响因子
     """
+    _print_array_stats("relative_humidity", relative_humidity)
     es = calculate_saturation_vapor_pressure(temperature)
     ea = calculate_actual_vapor_pressure(temperature, relative_humidity)
 
     vpd = es - ea
 
-    return vpd.astype(np.float32)
+    return vpd
 
 
 def calculate_vapor_pressure_deficit_from_dewpoint(
@@ -145,5 +168,5 @@ def calculate_vapor_pressure_deficit_from_dewpoint(
 
     vpd = es - ea
 
-    return vpd.astype(np.float32)
+    return vpd
 

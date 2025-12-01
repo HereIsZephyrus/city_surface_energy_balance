@@ -404,7 +404,7 @@ class DistrictRegressionModel:
                     return (pred - y_residual[i]) ** 2
 
                 # 优化Ta（约束在合理范围）
-                bounds = [(273.15, 323.15)]  # 0°C到50°C
+                bounds = [(283.0, 308.0)]  # 7°C到37°C
                 result = minimize(
                     objective,
                     x0=Ta[i],

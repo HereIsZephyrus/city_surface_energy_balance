@@ -42,17 +42,34 @@ def calculate_roughness_from_lcz(lcz: np.ndarray) -> np.ndarray:
     根据LCZ数据计算粗糙度长度
 
     参数:
-        lcz: LCZ分类栅格数组
+        lcz: LCZ分类栅格数组（可能包含NaN）
 
     返回:
-        粗糙度长度数组 (m)
+        粗糙度长度数组 (m)，NaN区域保持NaN
     """
-    lcz_int = lcz.astype(int)
-    roughness = np.full_like(lcz_int, 0.5, dtype=np.float32)  # 默认值
-
-    for lcz_val, z0 in LCZ_ROUGHNESS.items():
-        roughness[lcz_int == lcz_val] = z0
-
+    # 创建输出数组，NaN区域保持NaN
+    roughness = np.full_like(lcz, np.nan, dtype=np.float32)
+    
+    # 只处理有效的LCZ值（1-14且非NaN）
+    valid_mask = np.isfinite(lcz) & (lcz >= 1) & (lcz <= 14)
+    
+    if np.any(valid_mask):
+        # 对有效区域设置默认值
+        roughness[valid_mask] = 0.5  # 默认值
+        
+        # 根据LCZ类型设置粗糙度
+        # 只在有效区域内进行类型转换，避免NaN警告
+        lcz_valid_float = lcz[valid_mask]
+        lcz_valid_int = lcz_valid_float.astype(int)
+        for lcz_val, z0 in LCZ_ROUGHNESS.items():
+            # 在有效区域内查找匹配的LCZ值
+            match_mask = (lcz_valid_int == lcz_val)
+            if np.any(match_mask):
+                # 将匹配的位置映射回原始数组
+                valid_indices = np.where(valid_mask)
+                match_indices = (valid_indices[0][match_mask], valid_indices[1][match_mask])
+                roughness[match_indices] = z0
+    
     return roughness
 
 
@@ -142,13 +159,15 @@ def calculate_aerodynamic_parameters(
     dewpoint_2m = collection.get_array('era5_dewpoint_temperature_2m')
     u_wind = collection.get_array('era5_u_component_of_wind_10m')
     v_wind = collection.get_array('era5_v_component_of_wind_10m')
-    lst = collection.get_array('landsat_lst')
+    lst = collection.get_array('landsat_lst').astype(np.float64)
     ndvi = collection.get_array('landsat_ndvi')
     dem = collection.get_array('dem')
     lcz = collection.get_array('lcz')
     
     # DEM 特殊处理
     dem[dem == -999] = np.nan
+    # LST nodata 处理：非物理值视为缺失
+    lst[(lst <= 0) | (lst < 280)] = np.nan
     
     # 创建参考栅格的有效数据掩膜（基于 NDVI）
     # 只有 NDVI 有效的区域才进行计算
@@ -215,8 +234,14 @@ def calculate_aerodynamic_parameters(
         roughness = np.where(valid_building_mask, building_roughness, lcz_roughness)
         if verbose:
             building_pixels = np.sum(valid_building_mask)
-            print(f"  建筑粗糙度像元: {building_pixels}")
-            print(f"  LCZ粗糙度像元: {np.sum(~valid_building_mask)}")
+            lcz_pixels = np.sum(~valid_building_mask)
+            total_pixels = roughness.size
+            valid_lcz_mask = np.isfinite(lcz_roughness)
+            valid_lcz_pixels = np.sum(valid_lcz_mask)
+            print(f"  建筑粗糙度像元: {building_pixels} ({building_pixels/total_pixels*100:.1f}%)")
+            print(f"  LCZ粗糙度像元: {lcz_pixels} ({lcz_pixels/total_pixels*100:.1f}%)")
+            print(f"  LCZ数据有效像元: {valid_lcz_pixels} ({valid_lcz_pixels/total_pixels*100:.1f}%)")
+            print(f"  总像元数: {total_pixels}")
     else:
         roughness = lcz_roughness
     
@@ -247,13 +272,15 @@ def calculate_aerodynamic_parameters(
     # 6. 阻抗
     if verbose:
         print("计算阻抗参数...")
+    # 将LCZ转换为int，但先处理NaN避免警告
+    # calculate_aerodynamic_resistance内部会处理NaN，这里传入float类型
     rah = calculate_aerodynamic_resistance(
         wind_speed=wind_speed,
         roughness_length=roughness,
-        lcz=lcz.astype(int),
+        lcz=lcz,  # 传入float类型，函数内部会处理NaN
         displacement_height=displacement_height
     )
-    rs = calculate_surface_resistance(ndvi=ndvi)
+    rs = calculate_surface_resistance(ndvi=ndvi, lcz=lcz)
 
 
     # 释放阻抗计算中使用的临时数据
@@ -283,6 +310,7 @@ def calculate_aerodynamic_parameters(
         print(f"  饱和水汽压: {np.nanmean(es):.3f} kPa")
         print(f"  空气动力学阻抗: {np.nanmean(rah):.1f} s/m")
         print(f"  表面阻抗: {np.nanmean(rs):.1f} s/m")
+        print(f"  粗糙度长度: {np.nanmean(roughness):.4f} m")
 
     return output
 

@@ -5,27 +5,35 @@
 
 模式:
     physics:    物理计算（能量平衡系数）
-    regression: 街区回归（ALS求解气温）
+    als:        ALS 回归（求解气温，输出 Ta 栅格和系数）
+    spatial:    空间滞后模型分析（水平交换项 ΔQ_A）
+    regression: 完整回归工作流（als + spatial）
     full:       完整工作流（physics + regression）
 
 工作流程:
     1. 数据加载与对齐 (ERA5 + Landsat + DEM + LCZ)
     2. 空气动力学参数计算 (密度、风速、水汽压、阻抗)
     3. 能量平衡系数计算 (∂f/∂Ta, residual)
-    4. 街区聚合与ALS回归求解 (可选)
-    5. 结果输出
+    4. ALS 回归求解各街区气温
+    5. 空间滞后模型分析水平交换项
+    6. 结果输出
 
 使用方法:
     # 物理计算模式
-    python -m src physics --era5 <era5.tif> --landsat <landsat.tif> --dem <dem.tif> \\
+    python -m src physics --era5 <era5.tif> --landsat <landsat.tif> --albedo <albedo.tif> --dem <dem.tif> \\
         --lcz <lcz.tif> --datetime 202308151030 -o <output.tif>
     
-    # 街区回归模式（使用physics模块的缓存）
-    python -m src regression --cachedir <cache_dir> --districts <districts.gpkg> \\
-        -o <result.gpkg>
+    # ALS 回归模式（输出 Ta 栅格和系数 CSV）
+    python -m src als --cachedir <cache_dir> --districts <districts.gpkg> -o <output_prefix>
+    
+    # 空间滞后模型分析
+    python -m src spatial --input <als_result.gpkg> -o <spatial_result.gpkg>
+    
+    # 完整回归工作流（als + spatial）
+    python -m src regression --cachedir <cache_dir> --districts <districts.gpkg> -o <result.gpkg>
     
     # 完整工作流
-    python -m src full --era5 <era5.tif> --landsat <landsat.tif> --dem <dem.tif> \\
+    python -m src full --era5 <era5.tif> --landsat <landsat.tif> --albedo <albedo.tif> --dem <dem.tif> \\
         --lcz <lcz.tif> --datetime 202308151030 --districts <districts.gpkg> \\
         --cachedir <cache_dir> -o <result.gpkg>
 
@@ -57,10 +65,15 @@ def create_physics_parser(subparsers):
     # 输入文件
     parser.add_argument('--era5', required=True, help='ERA5 tif文件路径')
     parser.add_argument('--landsat', required=True, help='Landsat tif文件路径')
+    parser.add_argument('--albedo', required=True, help='地表反照率tif文件路径')
     parser.add_argument('--dem', required=True, help='DEM tif文件路径')
     parser.add_argument('--lcz', required=True, help='LCZ栅格文件路径 (.tif)')
-    parser.add_argument('--building', type=str, default=None,
-                        help='建筑数据文件路径 (.gpkg，可选)')
+    parser.add_argument('--building-height', type=str, required=True,
+                        help='建筑高度栅格文件路径 (.tif，必需，nodata处高度为0)')
+    parser.add_argument('--building', type=str, required=True,
+                        help='建筑数据文件路径 (.gpkg，必需)')
+    parser.add_argument('--voronoi-diagram', type=str, required=True,
+                        help='Voronoi图文件路径 (.gpkg，必需，id与building的id对应，用于栅格化粗糙度结果)')
     
     # 时间参数
     parser.add_argument('--datetime', required=True,
@@ -86,13 +99,13 @@ def create_physics_parser(subparsers):
     return parser
 
 
-def create_regression_parser(subparsers):
-    """创建回归分析模式的参数解析器"""
+def create_als_parser(subparsers):
+    """创建 ALS 回归模式的参数解析器"""
     parser = subparsers.add_parser(
-        'regression',
-        help='街区回归模式 - ALS求解气温',
+        'als',
+        help='ALS 回归模式 - 求解气温，输出 Ta 栅格和系数',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description='从能量平衡系数求解各街区气温'
+        description='从能量平衡系数求解各街区气温，输出 Ta 栅格和回归系数'
     )
     
     # 输入
@@ -100,22 +113,110 @@ def create_regression_parser(subparsers):
                         help='缓存目录路径（physics模块输出）')
     parser.add_argument('--districts', required=True,
                         help='街区矢量数据路径 (.gpkg)')
+    parser.add_argument('--voronoi', type=str, default=None,
+                        help='Voronoi图路径（用于栅格化，可选）')
     
     # 回归特征
     parser.add_argument('--district-id', default='district_id',
                         help='街区ID字段名 (默认: district_id)')
     parser.add_argument('--x-f', type=str, default=None,
-                        help='人为热Q_F特征列名，逗号分隔')
+                        help='人为热Q_F特征列名（连续变量），逗号分隔')
     parser.add_argument('--x-s', type=str, default=None,
-                        help='储热ΔQ_Sb特征列名，逗号分隔')
-    parser.add_argument('--x-a', type=str, default=None,
-                        help='水平交换ΔQ_A特征列名，逗号分隔')
+                        help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
+    parser.add_argument('--x-c', type=str, default=None,
+                        help='分类特征列名（将进行one-hot编码），逗号分隔')
     
     # 回归参数
-    parser.add_argument('--max-iter', type=int, default=20,
-                        help='ALS最大迭代次数 (默认: 20)')
+    parser.add_argument('--max-iter', type=int, default=500,
+                        help='ALS最大迭代次数 (默认: 100)')
     parser.add_argument('--tol', type=float, default=1e-4,
                         help='收敛容差 (默认: 1e-4)')
+    parser.add_argument('--ridge-alpha', type=float, default=0.0,
+                        help='岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）')
+    parser.add_argument('--quiet', action='store_true',
+                        help='静默模式')
+    
+    # 输出
+    parser.add_argument('-o', '--output', required=True,
+                        help='输出文件前缀（将生成 .gpkg, _Ta.tif, _coefficients.csv）')
+    
+    return parser
+
+
+def create_spatial_parser(subparsers):
+    """创建空间滞后模型分析模式的参数解析器"""
+    parser = subparsers.add_parser(
+        'spatial',
+        help='空间滞后模型分析 - 水平交换项 ΔQ_A',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='分析气温的空间自相关（水平交换项 ΔQ_A）'
+    )
+    
+    # 输入
+    parser.add_argument('--input', required=True,
+                        help='ALS 回归输出文件路径 (.gpkg)')
+    
+    # 空间分析参数
+    parser.add_argument('--ta-column', default='Ta_optimized',
+                        help='气温列名 (默认: Ta_optimized)')
+    parser.add_argument('--district-id', default='district_id',
+                        help='街区ID字段名 (默认: district_id)')
+    parser.add_argument('--distance-threshold', type=float, default=500.0,
+                        help='空间权重距离阈值(m) (默认: 500)')
+    parser.add_argument('--distance-decay', type=str, default='binary',
+                        choices=['binary', 'linear', 'inverse', 'gaussian'],
+                        help='距离衰减函数 (默认: binary)')
+    parser.add_argument('--quiet', action='store_true',
+                        help='静默模式')
+    
+    # 输出
+    parser.add_argument('-o', '--output', required=True,
+                        help='输出文件路径 (.gpkg/.csv)')
+    
+    return parser
+
+
+def create_regression_parser(subparsers):
+    """创建完整回归分析模式的参数解析器（als + spatial）"""
+    parser = subparsers.add_parser(
+        'regression',
+        help='完整回归模式 - ALS + 空间分析',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='执行完整回归工作流：ALS 回归 + 空间滞后模型分析'
+    )
+    
+    # 输入
+    parser.add_argument('--cachedir', required=True,
+                        help='缓存目录路径（physics模块输出）')
+    parser.add_argument('--districts', required=True,
+                        help='街区矢量数据路径 (.gpkg)')
+    parser.add_argument('--voronoi', type=str, default=None,
+                        help='Voronoi图路径（用于栅格化，可选）')
+    
+    # 回归特征
+    parser.add_argument('--district-id', default='district_id',
+                        help='街区ID字段名 (默认: district_id)')
+    parser.add_argument('--x-f', type=str, default=None,
+                        help='人为热Q_F特征列名（连续变量），逗号分隔')
+    parser.add_argument('--x-s', type=str, default=None,
+                        help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
+    parser.add_argument('--x-c', type=str, default=None,
+                        help='分类特征列名（将进行one-hot编码），逗号分隔')
+    
+    # 空间自相关参数（水平交换项 ΔQ_A）
+    parser.add_argument('--distance-threshold', type=float, default=500.0,
+                        help='空间权重距离阈值(m) (默认: 500)')
+    parser.add_argument('--distance-decay', type=str, default='binary',
+                        choices=['binary', 'linear', 'inverse', 'gaussian'],
+                        help='距离衰减函数 (默认: binary)')
+    
+    # 回归参数
+    parser.add_argument('--max-iter', type=int, default=500,
+                        help='ALS最大迭代次数 (默认: 100)')
+    parser.add_argument('--tol', type=float, default=1e-4,
+                        help='收敛容差 (默认: 1e-4)')
+    parser.add_argument('--ridge-alpha', type=float, default=0.0,
+                        help='岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）')
     parser.add_argument('--quiet', action='store_true',
                         help='静默模式')
     
@@ -139,10 +240,15 @@ def create_full_parser(subparsers):
     input_group = parser.add_argument_group('输入数据')
     input_group.add_argument('--era5', required=True, help='ERA5 tif文件路径')
     input_group.add_argument('--landsat', required=True, help='Landsat tif文件路径')
+    input_group.add_argument('--albedo', required=True, help='地表反照率tif文件路径')
     input_group.add_argument('--dem', required=True, help='DEM tif文件路径')
     input_group.add_argument('--lcz', required=True, help='LCZ栅格文件路径')
-    input_group.add_argument('--building', type=str, default=None,
-                             help='建筑数据文件路径 (.gpkg)')
+    input_group.add_argument('--building-height', type=str, required=True,
+                             help='建筑高度栅格文件路径 (.tif，必需，nodata处高度为0)')
+    input_group.add_argument('--building', type=str, required=True,
+                             help='建筑数据文件路径 (.gpkg，必需)')
+    input_group.add_argument('--voronoi-diagram', type=str, required=True,
+                             help='Voronoi图文件路径 (.gpkg，必需，id与building的id对应)')
     input_group.add_argument('--districts', required=True,
                              help='街区矢量数据路径 (.gpkg)')
     
@@ -162,15 +268,25 @@ def create_full_parser(subparsers):
     reg_group.add_argument('--district-id', default='district_id',
                            help='街区ID字段名')
     reg_group.add_argument('--x-f', type=str, default=None,
-                           help='人为热Q_F特征列名，逗号分隔')
+                           help='人为热Q_F特征列名（连续变量），逗号分隔')
     reg_group.add_argument('--x-s', type=str, default=None,
-                           help='储热ΔQ_Sb特征列名，逗号分隔')
-    reg_group.add_argument('--x-a', type=str, default=None,
-                           help='水平交换ΔQ_A特征列名，逗号分隔')
-    reg_group.add_argument('--max-iter', type=int, default=20,
+                           help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
+    reg_group.add_argument('--x-c', type=str, default=None,
+                           help='分类特征列名（将进行one-hot编码），逗号分隔')
+    reg_group.add_argument('--max-iter', type=int, default=500,
                            help='ALS最大迭代次数')
     reg_group.add_argument('--tol', type=float, default=1e-4,
                            help='收敛容差')
+    reg_group.add_argument('--ridge-alpha', type=float, default=0.0,
+                           help='岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）')
+    
+    # === 空间自相关参数（水平交换项 ΔQ_A）===
+    spatial_group = parser.add_argument_group('空间自相关参数')
+    spatial_group.add_argument('--distance-threshold', type=float, default=5000.0,
+                               help='空间权重距离阈值(m) (默认: 5000)')
+    spatial_group.add_argument('--distance-decay', type=str, default='binary',
+                               choices=['binary', 'linear', 'inverse', 'gaussian'],
+                               help='距离衰减函数 (默认: binary)')
     
     # === 缓存和输出 ===
     cache_group = parser.add_argument_group('缓存和输出')
@@ -192,10 +308,79 @@ def run_physics(args):
     physics_main(args)
 
 
+def run_als(args):
+    """执行 ALS 回归模式"""
+    from .als import main as als_main
+    als_main(args)
+
+
+def run_spatial(args):
+    """执行空间滞后模型分析模式"""
+    from .spatial import main as spatial_main
+    spatial_main(args)
+
+
 def run_regression(args):
-    """执行回归分析模式"""
-    from .regression import main as regression_main
-    regression_main(args)
+    """执行完整回归分析模式（als + spatial）"""
+    from pathlib import Path
+    from types import SimpleNamespace
+    
+    print("\n" + "=" * 60)
+    print("完整回归工作流: ALS 回归 + 空间分析")
+    print("=" * 60)
+    
+    # 第一步: ALS 回归
+    print("\n>>> 阶段 1/2: ALS 回归 <<<")
+    
+    # 构建 ALS 参数
+    output_path = Path(args.output)
+    als_output_prefix = str(output_path.with_suffix(''))
+    
+    als_args = SimpleNamespace(
+        cachedir=args.cachedir,
+        districts=args.districts,
+        voronoi=getattr(args, 'voronoi', None),
+        output=als_output_prefix,
+        district_id=getattr(args, 'district_id', 'district_id'),
+        x_f=getattr(args, 'x_f', None),
+        x_s=getattr(args, 'x_s', None),
+        x_c=getattr(args, 'x_c', None),
+        max_iter=getattr(args, 'max_iter', 500),
+        tol=getattr(args, 'tol', 1e-4),
+        ridge_alpha=getattr(args, 'ridge_alpha', 0.0),
+        quiet=getattr(args, 'quiet', False)
+    )
+    
+    from .als import main as als_main
+    als_main(als_args)
+    
+    # 第二步: 空间滞后模型分析
+    print("\n>>> 阶段 2/2: 空间滞后模型分析 <<<")
+    
+    # ALS 输出的街区结果文件
+    als_result_path = als_output_prefix + '.gpkg'
+    
+    spatial_args = SimpleNamespace(
+        input=als_result_path,
+        output=args.output,
+        ta_column='Ta_optimized',
+        district_id=getattr(args, 'district_id', 'district_id'),
+        distance_threshold=getattr(args, 'distance_threshold', 500.0),
+        distance_decay=getattr(args, 'distance_decay', 'binary'),
+        quiet=getattr(args, 'quiet', False)
+    )
+    
+    from .spatial import main as spatial_main
+    spatial_main(spatial_args)
+    
+    print("\n" + "=" * 60)
+    print("✓ 完整回归工作流完成!")
+    print("=" * 60)
+    print(f"\n输出文件:")
+    print(f"  街区结果: {als_result_path}")
+    print(f"  Ta 栅格: {als_output_prefix}_Ta.tif")
+    print(f"  系数: {als_output_prefix}_coefficients.csv")
+    print(f"  空间分析: {args.output}")
 
 
 def run_full(args):
@@ -204,11 +389,11 @@ def run_full(args):
     from types import SimpleNamespace
     
     print("\n" + "=" * 60)
-    print("完整工作流: 物理计算 + 街区回归")
+    print("完整工作流: 物理计算 + ALS 回归 + 空间分析")
     print("=" * 60)
     
     # 第一步: 物理计算
-    print("\n>>> 阶段 1/2: 物理计算 <<<")
+    print("\n>>> 阶段 1/3: 物理计算 <<<")
     
     # 构建 physics 参数
     physics_output = str(Path(args.output).with_suffix('.tif'))
@@ -221,9 +406,12 @@ def run_full(args):
     physics_args = SimpleNamespace(
         era5=args.era5,
         landsat=args.landsat,
+        albedo=args.albedo,
         dem=args.dem,
         lcz=args.lcz,
+        building_height=args.building_height,
         building=args.building,
+        voronoi_diagram=args.voronoi_diagram,
         datetime=args.datetime,
         std_meridian=getattr(args, 'std_meridian', 120.0),
         crs=args.crs,
@@ -236,32 +424,59 @@ def run_full(args):
     from .physics import main as physics_main
     physics_main(physics_args)
     
-    # 第二步: 街区回归
-    print("\n>>> 阶段 2/2: 街区回归 <<<")
+    # 第二步: ALS 回归
+    print("\n>>> 阶段 2/3: ALS 回归 <<<")
     
-    # 构建 regression 参数
-    regression_args = SimpleNamespace(
+    # 构建 ALS 参数
+    output_path = Path(args.output)
+    als_output_prefix = str(output_path.with_suffix(''))
+    
+    als_args = SimpleNamespace(
         cachedir=args.cachedir,
         districts=args.districts,
-        output=args.output,
+        voronoi=args.voronoi_diagram,
+        output=als_output_prefix,
         district_id=getattr(args, 'district_id', 'district_id'),
         x_f=getattr(args, 'x_f', None),
         x_s=getattr(args, 'x_s', None),
-        x_a=getattr(args, 'x_a', None),
-        max_iter=getattr(args, 'max_iter', 20),
+        x_c=getattr(args, 'x_c', None),
+        max_iter=getattr(args, 'max_iter', 500),
         tol=getattr(args, 'tol', 1e-4),
+        ridge_alpha=getattr(args, 'ridge_alpha', 0.0),
         quiet=getattr(args, 'quiet', False)
     )
     
-    from .regression import main as regression_main
-    regression_main(regression_args)
+    from .als import main as als_main
+    als_main(als_args)
+    
+    # 第三步: 空间滞后模型分析
+    print("\n>>> 阶段 3/3: 空间滞后模型分析 <<<")
+    
+    # ALS 输出的街区结果文件
+    als_result_path = als_output_prefix + '.gpkg'
+    
+    spatial_args = SimpleNamespace(
+        input=als_result_path,
+        output=args.output,
+        ta_column='Ta_optimized',
+        district_id=getattr(args, 'district_id', 'district_id'),
+        distance_threshold=getattr(args, 'distance_threshold', 500.0),
+        distance_decay=getattr(args, 'distance_decay', 'binary'),
+        quiet=getattr(args, 'quiet', False)
+    )
+    
+    from .spatial import main as spatial_main
+    spatial_main(spatial_args)
     
     print("\n" + "=" * 60)
     print("✓ 完整工作流完成!")
     print("=" * 60)
     print(f"\n输出文件:")
     print(f"  物理计算: {physics_output}")
-    print(f"  回归结果: {args.output}")
+    print(f"  街区结果: {als_result_path}")
+    print(f"  Ta 栅格: {als_output_prefix}_Ta.tif")
+    print(f"  系数: {als_output_prefix}_coefficients.csv")
+    print(f"  空间分析: {args.output}")
 
 
 def main():
@@ -273,20 +488,27 @@ def main():
         epilog="""
 模式说明:
     physics     计算栅格级能量平衡系数
-    regression  从能量平衡系数求解街区气温（需要先运行physics）
-    full        执行完整工作流（physics + regression）
+    als         ALS 回归求解气温（输出 Ta 栅格和系数）
+    spatial     空间滞后模型分析（水平交换项 ΔQ_A）
+    regression  完整回归工作流（als + spatial）
+    full        完整工作流（physics + als + spatial）
 
 示例:
     # 物理计算
-    python -m src physics --era5 era5.tif --landsat landsat.tif --dem dem.tif \\
+    python -m src physics --era5 era5.tif --landsat landsat.tif --albedo albedo.tif --dem dem.tif \\
         --lcz lcz.tif --datetime 202308151030 -o result.tif
     
-    # 街区回归
-    python -m src regression --cachedir ./cache --districts districts.gpkg \\
-        -o result.gpkg
+    # ALS 回归（输出 Ta 栅格和系数）
+    python -m src als --cachedir ./cache --districts districts.gpkg -o result_prefix
+    
+    # 空间滞后模型分析
+    python -m src spatial --input als_result.gpkg -o spatial_result.gpkg
+    
+    # 完整回归工作流
+    python -m src regression --cachedir ./cache --districts districts.gpkg -o result.gpkg
     
     # 完整工作流
-    python -m src full --era5 era5.tif --landsat landsat.tif --dem dem.tif \\
+    python -m src full --era5 era5.tif --landsat landsat.tif --albedo albedo.tif --dem dem.tif \\
         --lcz lcz.tif --datetime 202308151030 --districts districts.gpkg \\
         --cachedir ./cache -o result.gpkg
         """
@@ -302,6 +524,8 @@ def main():
     
     # 添加各模式的解析器
     create_physics_parser(subparsers)
+    create_als_parser(subparsers)
+    create_spatial_parser(subparsers)
     create_regression_parser(subparsers)
     create_full_parser(subparsers)
     
@@ -316,6 +540,10 @@ def main():
     # 根据模式执行
     if args.mode == 'physics':
         run_physics(args)
+    elif args.mode == 'als':
+        run_als(args)
+    elif args.mode == 'spatial':
+        run_spatial(args)
     elif args.mode == 'regression':
         run_regression(args)
     elif args.mode == 'full':
