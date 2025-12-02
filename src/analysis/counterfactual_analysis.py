@@ -12,10 +12,6 @@
     如果某块自然景观（绿地、水体等）变成建成区，气温会升高多少？
     这个升温量即为该自然景观的降温贡献。
 
-依赖:
-    - als_regression: 提供ALS回归求解
-    - spatial_analysis: 提供空间权重矩阵和空间自相关分析
-
 参考文献:
     Stewart, I. D., & Oke, T. R. (2012). Local Climate Zones for urban
     temperature studies. Bulletin of the American Meteorological Society.
@@ -29,36 +25,12 @@ from dataclasses import dataclass
 import warnings
 
 from ..regression.als_regression import ALSRegression
+from .constants import (
+    LCZ_NATURAL_NUMERIC,
+    LCZ_NATURAL_STRING,
+    LCZ_NATURAL_NAMES,
+)
 from .spatial_analysis import SpatialWeightMatrix, analyze_spatial_autocorrelation
-
-
-# LCZ 分类常量
-LCZ_NATURAL = {
-    'A': '密集树木 (Dense Trees)',
-    'B': '稀疏树木 (Scattered Trees)',
-    'C': '灌木 (Bush/Scrub)',
-    'D': '低矮植被 (Low Plants)',
-    'E': '裸岩/铺面 (Bare Rock/Paved)',
-    'F': '裸土/沙 (Bare Soil/Sand)',
-    'G': '水体 (Water)',
-}
-
-LCZ_BUILT = {
-    '1': '紧凑高层 (Compact High-rise)',
-    '2': '紧凑中层 (Compact Mid-rise)',
-    '3': '紧凑低层 (Compact Low-rise)',
-    '4': '开敞高层 (Open High-rise)',
-    '5': '开敞中层 (Open Mid-rise)',
-    '6': '开敞低层 (Open Low-rise)',
-    '7': '轻质低层 (Lightweight Low-rise)',
-    '8': '大型低层 (Large Low-rise)',
-    '9': '稀疏建筑 (Sparsely Built)',
-    '10': '重工业 (Heavy Industry)',
-}
-
-# 数值型LCZ编码（某些数据集使用）
-LCZ_NATURAL_NUMERIC = [11, 12, 13, 14, 15, 16, 17]  # 对应 A-G
-LCZ_BUILT_NUMERIC = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 
 @dataclass
@@ -143,16 +115,10 @@ class CounterfactualAnalyzer:
         self.natural_lcz_values = natural_lcz_values
         self.replacement_lcz = replacement_lcz
         self.verbose = verbose
-        
-        # 结果缓存
         self.result: Optional[CounterfactualResult] = None
         
     def _detect_lcz_format(self, lcz_values: np.ndarray) -> str:
-        """
-        检测LCZ编码格式
-        
-        返回: 'string' (A-G, 1-10) 或 'numeric' (1-17)
-        """
+        """检测LCZ编码格式，返回 'string' 或 'numeric'"""
         sample = lcz_values[~pd.isna(lcz_values)]
         if len(sample) == 0:
             return 'unknown'
@@ -171,26 +137,16 @@ class CounterfactualAnalyzer:
         lcz_values: np.ndarray,
         natural_lcz_values: Optional[List] = None
     ) -> np.ndarray:
-        """
-        获取自然景观掩膜
-        
-        参数:
-            lcz_values: LCZ值数组
-            natural_lcz_values: 自然景观LCZ值列表（可选）
-            
-        返回:
-            布尔掩膜数组
-        """
+        """获取自然景观掩膜"""
         if natural_lcz_values is None:
-            # 自动检测格式并使用默认值
             fmt = self._detect_lcz_format(lcz_values)
             if fmt == 'string':
-                natural_lcz_values = ['A', 'B', 'C', 'D', 'G']  # 排除E(裸岩)、F(裸土)
+                natural_lcz_values = LCZ_NATURAL_STRING
             elif fmt == 'numeric':
-                natural_lcz_values = [11, 12, 13, 14, 17]  # A, B, C, D, G
+                natural_lcz_values = LCZ_NATURAL_NUMERIC
             else:
                 warnings.warn("无法检测LCZ格式，使用数值型默认值")
-                natural_lcz_values = [11, 12, 13, 14, 17]
+                natural_lcz_values = LCZ_NATURAL_NUMERIC
         
         return np.isin(lcz_values, natural_lcz_values)
     
@@ -215,8 +171,9 @@ class CounterfactualAnalyzer:
         districts_gdf: gpd.GeoDataFrame,
         X_F: np.ndarray,
         X_S: np.ndarray,
-        f_Ta_coeffs: np.ndarray,
+        f_Ta_coeff1: np.ndarray,
         y_residual: np.ndarray,
+        f_Ta_coeff2: Optional[np.ndarray] = None,
         era5_Ta_mean: Optional[np.ndarray] = None,
         lcz_column: str = 'LCZ',
         natural_lcz_values: Optional[List] = None,
@@ -232,8 +189,9 @@ class CounterfactualAnalyzer:
             districts_gdf: 街区GeoDataFrame（含LCZ列）
             X_F: 人为热特征矩阵
             X_S: 储热特征矩阵
-            f_Ta_coeffs: Ta系数
+            f_Ta_coeff1: Ta一次项系数
             y_residual: 残差
+            f_Ta_coeff2: Ta二次项系数（可选）
             era5_Ta_mean: ERA5气温初值
             lcz_column: LCZ列名
             natural_lcz_values: 自然景观LCZ值列表
@@ -249,23 +207,22 @@ class CounterfactualAnalyzer:
         
         n_districts = len(districts_gdf)
         
-        # 使用实例默认值或参数值
         if natural_lcz_values is None:
             natural_lcz_values = self.natural_lcz_values
         if replacement_lcz is None:
             replacement_lcz = self.replacement_lcz
         
-        # 1. 获取原始气温
+        # 获取原始气温
         Ta_original = als_model.Ta_per_district.copy()
         
-        # 2. 获取LCZ值
+        # 获取LCZ值
         if lcz_column not in districts_gdf.columns:
             raise ValueError(f"LCZ列 '{lcz_column}' 不存在于 districts_gdf")
         
         lcz_original = districts_gdf[lcz_column].values.copy()
         lcz_format = self._detect_lcz_format(lcz_original)
         
-        # 3. 识别自然景观街区
+        # 识别自然景观街区
         natural_mask = self._get_natural_mask(lcz_original, natural_lcz_values)
         n_natural = natural_mask.sum()
         
@@ -281,7 +238,6 @@ class CounterfactualAnalyzer:
         
         if n_natural == 0:
             warnings.warn("没有检测到自然景观街区")
-            # 返回零贡献结果
             return CounterfactualResult(
                 Ta_original=Ta_original,
                 Ta_counterfactual=Ta_original.copy(),
@@ -297,7 +253,7 @@ class CounterfactualAnalyzer:
                 mean_cooling_all=0.0
             )
         
-        # 4. 构建反事实LCZ
+        # 构建反事实LCZ
         replacement_lcz_normalized = self._normalize_replacement_lcz(
             replacement_lcz, lcz_format
         )
@@ -308,20 +264,14 @@ class CounterfactualAnalyzer:
             print("\n正在进行反事实模拟...")
             print(f"  替换 {n_natural} 个自然景观街区为 LCZ {replacement_lcz_normalized}")
         
-        # 5. 重新拟合ALS模型（使用替换后的LCZ）
-        # 注意：这里需要重新构建特征矩阵
-        # 为简化，假设LCZ对模型的影响主要通过物理参数（如表面粗糙度）
-        # 这里使用一个简化方法：直接修改与LCZ相关的物理参数
-        
+        # 重新拟合ALS模型
         als_counterfactual = ALSRegression()
         
-        # 使用相同的输入拟合反事实模型
-        # 注意：理想情况下应该重新计算f_Ta_coeffs（因为它依赖于表面参数）
-        # 这里为简化，假设f_Ta_coeffs主要受辐射影响，LCZ替换后近似不变
         result_cf = als_counterfactual.fit(
             X_F=X_F,
             X_S=X_S,
-            f_Ta_coeffs=f_Ta_coeffs,
+            f_Ta_coeff1=f_Ta_coeff1,
+            f_Ta_coeff2=f_Ta_coeff2,
             y_residual=y_residual,
             era5_Ta_mean=era5_Ta_mean,
             max_iter=20,
@@ -331,11 +281,10 @@ class CounterfactualAnalyzer:
         
         Ta_counterfactual = result_cf['Ta_per_district']
         
-        # 6. 计算降温贡献
-        # 正值表示自然景观使气温降低
+        # 计算降温贡献
         cooling_contribution = Ta_counterfactual - Ta_original
         
-        # 7. 空间自相关分析（可选）
+        # 空间自相关分析（可选）
         spatial_original = None
         spatial_counterfactual = None
         
@@ -362,7 +311,7 @@ class CounterfactualAnalyzer:
             except (ValueError, np.linalg.LinAlgError, KeyError) as e:
                 warnings.warn(f"空间分析失败: {e}")
         
-        # 8. 计算统计摘要
+        # 计算统计摘要
         cooling_natural = cooling_contribution[natural_mask]
         
         mean_cooling = float(np.nanmean(cooling_natural))
@@ -370,7 +319,6 @@ class CounterfactualAnalyzer:
         std_cooling = float(np.nanstd(cooling_natural))
         mean_cooling_all = float(np.nanmean(cooling_contribution))
         
-        # 9. 创建结果对象
         self.result = CounterfactualResult(
             Ta_original=Ta_original,
             Ta_counterfactual=Ta_counterfactual,
@@ -399,16 +347,15 @@ class CounterfactualAnalyzer:
         districts_gdf: gpd.GeoDataFrame,
         X_F: np.ndarray,
         X_S: np.ndarray,
-        f_Ta_coeffs: np.ndarray,
+        f_Ta_coeff1: np.ndarray,
         y_residual: np.ndarray,
+        f_Ta_coeff2: Optional[np.ndarray] = None,
         era5_Ta_mean: Optional[np.ndarray] = None,
         lcz_column: str = 'LCZ',
         replacement_lcz: Optional[Union[str, int]] = None
     ) -> Dict[str, CounterfactualResult]:
         """
         按LCZ类型分别进行反事实分析
-        
-        分别计算每种自然景观类型的降温贡献。
         
         返回:
             Dict: {lcz_type: CounterfactualResult}
@@ -418,11 +365,10 @@ class CounterfactualAnalyzer:
         lcz_values = districts_gdf[lcz_column].values
         lcz_format = self._detect_lcz_format(lcz_values)
         
-        # 确定要分析的自然景观类型
         if lcz_format == 'string':
-            natural_types = ['A', 'B', 'C', 'D', 'G']
+            natural_types = LCZ_NATURAL_STRING
         else:
-            natural_types = [11, 12, 13, 14, 17]
+            natural_types = LCZ_NATURAL_NUMERIC
         
         if self.verbose:
             print("\n" + "=" * 60)
@@ -430,15 +376,13 @@ class CounterfactualAnalyzer:
             print("=" * 60)
         
         for lcz_type in natural_types:
-            # 检查是否存在该类型
             if not np.any(lcz_values == lcz_type):
                 continue
             
             if self.verbose:
-                type_name = LCZ_NATURAL.get(str(lcz_type), f'LCZ {lcz_type}')
+                type_name = LCZ_NATURAL_NAMES.get(str(lcz_type), f'LCZ {lcz_type}')
                 print(f"\n分析 {type_name}...")
             
-            # 仅替换该类型
             analyzer = CounterfactualAnalyzer(
                 natural_lcz_values=[lcz_type],
                 replacement_lcz=replacement_lcz or self.replacement_lcz,
@@ -450,8 +394,9 @@ class CounterfactualAnalyzer:
                 districts_gdf=districts_gdf,
                 X_F=X_F,
                 X_S=X_S,
-                f_Ta_coeffs=f_Ta_coeffs,
+                f_Ta_coeff1=f_Ta_coeff1,
                 y_residual=y_residual,
+                f_Ta_coeff2=f_Ta_coeff2,
                 era5_Ta_mean=era5_Ta_mean,
                 lcz_column=lcz_column,
                 include_spatial_analysis=False
@@ -472,7 +417,7 @@ class CounterfactualAnalyzer:
                 reverse=True
             )
             for i, (lcz_type, result) in enumerate(sorted_results, 1):
-                type_name = LCZ_NATURAL.get(lcz_type, f'LCZ {lcz_type}')
+                type_name = LCZ_NATURAL_NAMES.get(lcz_type, f'LCZ {lcz_type}')
                 print(f"  {i}. {type_name}: {result.mean_cooling:.2f} K "
                       f"(n={result.n_natural})")
             print("=" * 60)
@@ -522,55 +467,3 @@ def estimate_cooling_contribution(
         print(f"  全域平均: {result['mean_cooling_all']:.2f} K")
     
     return result
-
-
-def spatial_spillover_analysis(
-    cooling_contribution: np.ndarray,
-    districts_gdf: gpd.GeoDataFrame,
-    spatial_weights: Optional[SpatialWeightMatrix] = None,
-    distance_threshold: float = 500.0,
-    verbose: bool = True
-) -> Dict:
-    """
-    分析降温贡献的空间溢出效应
-    
-    检验自然景观的降温效应是否会扩散到周围街区。
-    
-    参数:
-        cooling_contribution: 降温贡献数组
-        districts_gdf: 街区GeoDataFrame
-        spatial_weights: 空间权重矩阵（可选，不提供则自动构建）
-        distance_threshold: 距离阈值 (m)
-        verbose: 是否打印信息
-        
-    返回:
-        空间溢出分析结果
-    """
-    if spatial_weights is None:
-        spatial_weights = SpatialWeightMatrix(
-            districts_gdf,
-            distance_threshold=distance_threshold
-        )
-    
-    # 使用空间自相关分析检验降温贡献的空间模式
-    result = analyze_spatial_autocorrelation(
-        cooling_contribution,
-        spatial_weights,
-        verbose=verbose
-    )
-    
-    if result:
-        # 添加物理解释
-        rho = result['rho']
-        if verbose:
-            print("\n空间溢出效应解释:")
-            if rho > 0.1:
-                print(f"  ρ = {rho:.3f} > 0: 降温效应存在正向空间溢出")
-                print("  即自然景观的降温会扩散到周围街区")
-            elif rho < -0.1:
-                print(f"  ρ = {rho:.3f} < 0: 存在降温的空间竞争效应")
-            else:
-                print(f"  ρ = {rho:.3f} ≈ 0: 降温效应主要是局部的，空间溢出不明显")
-    
-    return result
-
