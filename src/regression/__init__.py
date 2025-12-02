@@ -10,11 +10,8 @@
 物理模型:
     f^k(Ta) + Σαi·X^k_Fi + Σβi·X^k_Si = 0
 
-参考文献:
-    doc/晴朗无风条件下城市生态空间对城市降温作用量化模型.md
 """
 
-__version__ = '0.3.0'
 
 from .aggregator import DistrictAggregator
 from .als_regression import ALSRegression
