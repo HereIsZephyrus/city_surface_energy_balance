@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Union
 from dataclasses import dataclass
 import warnings
 
-from .als_regression import ALSRegression
+from ..regression.als_regression import ALSRegression
 from .spatial_analysis import SpatialWeightMatrix, analyze_spatial_autocorrelation
 
 

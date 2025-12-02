@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 
-from .regression.spatial_analysis import SpatialWeightMatrix, analyze_spatial_autocorrelation
+from .analysis import SpatialWeightMatrix, analyze_spatial_autocorrelation
 
 
 def run_spatial_analysis(

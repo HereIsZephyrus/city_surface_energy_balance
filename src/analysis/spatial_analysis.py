@@ -27,8 +27,9 @@ from typing import Dict, Optional, Union
 import numpy as np
 import geopandas as gpd
 from scipy.stats import norm
-from scipy.sparse import csr_matrix, lil_matrix, diags, save_npz, load_npz
+from scipy.sparse import csr_matrix, diags, save_npz, load_npz
 from shapely.strtree import STRtree
+from shapely import distance as shapely_distance
 
 
 class SpatialWeightMatrix:
@@ -227,39 +228,45 @@ class SpatialWeightMatrix:
         
         print(f"    找到 {len(left_indices)} 对邻居关系")
         
-        # 使用稀疏矩阵（LIL格式便于逐元素构建）
-        W = lil_matrix((self.n, self.n), dtype=np.float64)
-        
-        # 根据衰减函数计算权重
+        # 根据衰减函数计算权重（向量化操作）
         if self.decay_function == 'binary':
-            # 二值权重，无需计算距离
-            for i, j in zip(left_indices, right_indices):
-                W[i, j] = 1.0
+            # 二值权重，无需计算距离，直接构建 CSR 矩阵
+            weights = np.ones(len(left_indices), dtype=np.float64)
         else:
-            # 需要计算精确距离来确定权重
-            print(f"    计算精确距离并应用 {self.decay_function} 衰减函数...")
+            # 使用向量化的 Shapely distance 函数计算精确距离
+            print(f"    向量化计算距离并应用 {self.decay_function} 衰减函数...")
+            
+            # 向量化获取几何对象
+            geoms_left = geometries[left_indices]
+            geoms_right = geometries[right_indices]
+            
+            # 向量化计算距离（Shapely 2.0+ 原生支持）
+            distances = shapely_distance(geoms_left, geoms_right)
+            
+            # 向量化计算权重
             sigma = self.distance_threshold / 3  # 用于 gaussian 衰减
             
-            for idx, (i, j) in enumerate(zip(left_indices, right_indices)):
-                if (idx + 1) % 100000 == 0:
-                    print(f"      进度: {idx+1}/{len(left_indices)} ({100*(idx+1)/len(left_indices):.1f}%)")
-                
-                dist = geometries[i].distance(geometries[j])
-                
-                if self.decay_function == 'linear':
-                    weight = 1.0 - dist / self.distance_threshold
-                elif self.decay_function == 'inverse':
-                    weight = 1.0 / max(dist, 1.0)
-                elif self.decay_function == 'gaussian':
-                    weight = np.exp(-dist**2 / (2 * sigma**2))
-                else:
-                    weight = 0.0
-                
-                if weight > 0:
-                    W[i, j] = weight
+            if self.decay_function == 'linear':
+                weights = 1.0 - distances / self.distance_threshold
+            elif self.decay_function == 'inverse':
+                weights = 1.0 / np.maximum(distances, 1.0)
+            elif self.decay_function == 'gaussian':
+                weights = np.exp(-distances**2 / (2 * sigma**2))
+            else:
+                weights = np.zeros(len(distances), dtype=np.float64)
+            
+            # 过滤掉非正权重
+            positive_mask = weights > 0
+            left_indices = left_indices[positive_mask]
+            right_indices = right_indices[positive_mask]
+            weights = weights[positive_mask]
         
-        # 转换为 CSR 格式（更高效的矩阵运算）
-        W = W.tocsr()
+        # 直接使用 COO 格式数据构建 CSR 矩阵（比 LIL 更高效）
+        W = csr_matrix(
+            (weights, (left_indices, right_indices)),
+            shape=(self.n, self.n),
+            dtype=np.float64
+        )
         
         # 行标准化
         if self.row_standardize:
