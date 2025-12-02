@@ -3,12 +3,14 @@
 
 实现空间权重矩阵和空间滞后模型，用于分析水平交换项 ΔQ_A（气温空间自相关）。
 
+核心组件:
+    - SpatialWeightMatrix: 空间权重矩阵（稀疏矩阵优化）
+    - analyze_spatial_autocorrelation: Moran's I 和空间滞后模型分析
+
 物理背景:
     水平交换项 ΔQ_A 描述相邻街区之间因气温差异导致的热量交换。
-    由于 ΔQ_A 只与气温相关，不作为能量平衡方程的独立项，
-    而是在 ALS 求解 Ta 后，使用空间滞后模型分析气温的空间自相关特征。
-
-空间滞后模型:
+    使用空间滞后模型分析气温的空间自相关特征：
+    
     Ta = μ + ρ * W * Ta + ε
     
     其中:
@@ -27,8 +29,9 @@ from typing import Dict, Optional, Union
 import numpy as np
 import geopandas as gpd
 from scipy.stats import norm
-from scipy.sparse import csr_matrix, lil_matrix, diags, save_npz, load_npz
+from scipy.sparse import csr_matrix, diags, save_npz, load_npz
 from shapely.strtree import STRtree
+from shapely import distance as shapely_distance
 
 
 class SpatialWeightMatrix:
@@ -85,9 +88,8 @@ class SpatialWeightMatrix:
         if self._cache_dir and self._try_load_from_cache():
             print(f"  ✓ 从缓存加载空间权重矩阵: {self._cache_dir}")
         else:
-            # 使用稀疏矩阵和空间索引构建权重矩阵（内存高效）
+            # 使用稀疏矩阵和空间索引构建权重矩阵
             self.W = self._build_sparse_weight_matrix(districts_gdf)
-            # 计算邻居统计
             self.neighbor_counts = np.array(self.W.sum(axis=1)).flatten()
             # 保存到缓存
             if self._cache_dir:
@@ -95,12 +97,7 @@ class SpatialWeightMatrix:
     
     @staticmethod
     def _compute_geometry_hash(gdf: gpd.GeoDataFrame) -> str:
-        """
-        计算 GeoDataFrame 几何的哈希值，用于验证缓存有效性
-        
-        基于几何的 WKB 表示和数量计算哈希
-        """
-        # 使用前10个、中间10个和最后10个几何的 WKB 作为采样
+        """计算 GeoDataFrame 几何的哈希值，用于验证缓存有效性"""
         n = len(gdf)
         indices = []
         if n <= 30:
@@ -112,7 +109,6 @@ class SpatialWeightMatrix:
         for i in indices:
             geom = gdf.geometry.iloc[i]
             if geom is not None:
-                # 使用几何的 bounds 和 area 作为快速哈希
                 bounds = geom.bounds
                 area = geom.area
                 hash_data += f"{i}:{bounds}:{area:.6f};"
@@ -120,7 +116,7 @@ class SpatialWeightMatrix:
         return hashlib.md5(hash_data.encode()).hexdigest()[:16]
     
     def _get_cache_key(self) -> Dict:
-        """获取缓存键（用于验证缓存有效性）"""
+        """获取缓存键"""
         return {
             'n': self.n,
             'distance_threshold': self.distance_threshold,
@@ -130,12 +126,7 @@ class SpatialWeightMatrix:
         }
     
     def _try_load_from_cache(self) -> bool:
-        """
-        尝试从缓存加载权重矩阵
-        
-        返回:
-            bool: 是否成功从缓存加载
-        """
+        """尝试从缓存加载权重矩阵"""
         if not self._cache_dir:
             return False
         
@@ -146,20 +137,16 @@ class SpatialWeightMatrix:
             return False
         
         try:
-            # 加载元数据
             with open(metadata_path, 'rb') as f:
                 cached_metadata = pickle.load(f)
             
-            # 验证缓存有效性
             current_key = self._get_cache_key()
             if cached_metadata.get('cache_key') != current_key:
                 print(f"  缓存参数不匹配，将重新计算...")
                 return False
             
-            # 加载稀疏矩阵
             self.W = load_npz(matrix_path)
             self.neighbor_counts = cached_metadata['neighbor_counts']
-            
             return True
             
         except Exception as e:
@@ -176,7 +163,6 @@ class SpatialWeightMatrix:
         metadata_path = self._cache_dir / self.CACHE_METADATA_FILE
         matrix_path = self._cache_dir / self.CACHE_MATRIX_FILE
         
-        # 保存元数据
         metadata = {
             'cache_key': self._get_cache_key(),
             'neighbor_counts': self.neighbor_counts
@@ -184,9 +170,7 @@ class SpatialWeightMatrix:
         with open(metadata_path, 'wb') as f:
             pickle.dump(metadata, f)
         
-        # 保存稀疏矩阵
         save_npz(matrix_path, self.W)
-        
         print(f"  ✓ 空间权重矩阵已缓存: {self._cache_dir}")
     
     @classmethod
@@ -199,20 +183,12 @@ class SpatialWeightMatrix:
         )
     
     def _build_sparse_weight_matrix(self, districts_gdf: gpd.GeoDataFrame) -> csr_matrix:
-        """
-        使用空间索引和稀疏矩阵构建权重矩阵（内存高效）
-        
-        使用 STRtree 的 dwithin 谓词直接查询距离内的邻居，
-        避免创建缓冲区，大幅提升效率。
-        """
+        """使用空间索引和稀疏矩阵构建权重矩阵"""
         print(f"  构建空间权重矩阵（稀疏矩阵，n={self.n}）...")
         
-        # 使用 STRtree 空间索引
         geometries = districts_gdf.geometry.values
         tree = STRtree(geometries)
         
-        # 使用 dwithin 谓词批量查询距离内的所有邻居对
-        # 返回 (left_indices, right_indices)，表示 geometries[left] 与 geometries[right] 距离 < threshold
         print(f"    使用 dwithin 谓词查询邻居（距离阈值: {self.distance_threshold}m）...")
         left_indices, right_indices = tree.query(
             geometries, 
@@ -220,52 +196,49 @@ class SpatialWeightMatrix:
             distance=self.distance_threshold
         )
         
-        # 过滤掉自身（i == j 的情况）
+        # 过滤掉自身
         mask = left_indices != right_indices
         left_indices = left_indices[mask]
         right_indices = right_indices[mask]
         
         print(f"    找到 {len(left_indices)} 对邻居关系")
         
-        # 使用稀疏矩阵（LIL格式便于逐元素构建）
-        W = lil_matrix((self.n, self.n), dtype=np.float64)
-        
-        # 根据衰减函数计算权重
+        # 计算权重
         if self.decay_function == 'binary':
-            # 二值权重，无需计算距离
-            for i, j in zip(left_indices, right_indices):
-                W[i, j] = 1.0
+            weights = np.ones(len(left_indices), dtype=np.float64)
         else:
-            # 需要计算精确距离来确定权重
-            print(f"    计算精确距离并应用 {self.decay_function} 衰减函数...")
-            sigma = self.distance_threshold / 3  # 用于 gaussian 衰减
+            print(f"    向量化计算距离并应用 {self.decay_function} 衰减函数...")
             
-            for idx, (i, j) in enumerate(zip(left_indices, right_indices)):
-                if (idx + 1) % 100000 == 0:
-                    print(f"      进度: {idx+1}/{len(left_indices)} ({100*(idx+1)/len(left_indices):.1f}%)")
-                
-                dist = geometries[i].distance(geometries[j])
-                
-                if self.decay_function == 'linear':
-                    weight = 1.0 - dist / self.distance_threshold
-                elif self.decay_function == 'inverse':
-                    weight = 1.0 / max(dist, 1.0)
-                elif self.decay_function == 'gaussian':
-                    weight = np.exp(-dist**2 / (2 * sigma**2))
-                else:
-                    weight = 0.0
-                
-                if weight > 0:
-                    W[i, j] = weight
+            geoms_left = geometries[left_indices]
+            geoms_right = geometries[right_indices]
+            distances = shapely_distance(geoms_left, geoms_right)
+            
+            sigma = self.distance_threshold / 3
+            
+            if self.decay_function == 'linear':
+                weights = 1.0 - distances / self.distance_threshold
+            elif self.decay_function == 'inverse':
+                weights = 1.0 / np.maximum(distances, 1.0)
+            elif self.decay_function == 'gaussian':
+                weights = np.exp(-distances**2 / (2 * sigma**2))
+            else:
+                weights = np.zeros(len(distances), dtype=np.float64)
+            
+            positive_mask = weights > 0
+            left_indices = left_indices[positive_mask]
+            right_indices = right_indices[positive_mask]
+            weights = weights[positive_mask]
         
-        # 转换为 CSR 格式（更高效的矩阵运算）
-        W = W.tocsr()
+        W = csr_matrix(
+            (weights, (left_indices, right_indices)),
+            shape=(self.n, self.n),
+            dtype=np.float64
+        )
         
         # 行标准化
         if self.row_standardize:
             row_sums = np.array(W.sum(axis=1)).flatten()
-            row_sums[row_sums == 0] = 1  # 避免除以0
-            # 使用稀疏矩阵的逐元素除法（通过对角线矩阵）
+            row_sums[row_sums == 0] = 1
             inv_row_sums = 1.0 / row_sums
             W = diags(inv_row_sums, format='csr') @ W
         
@@ -274,26 +247,17 @@ class SpatialWeightMatrix:
         return W
     
     def spatial_lag(self, y: np.ndarray) -> np.ndarray:
-        """
-        计算空间滞后项 Wy
-        
-        参数:
-            y: 观测值向量 (n,)
-            
-        返回:
-            空间滞后值 Wy (n,)
-        """
+        """计算空间滞后项 Wy"""
         return self.W @ y
     
     def get_neighbors(self, idx: int) -> np.ndarray:
         """获取指定街区的邻居索引"""
-        # 对于稀疏矩阵，使用 getrow 方法
         row = self.W.getrow(idx)
         return row.indices
     
     def summary(self) -> Dict:
         """权重矩阵摘要统计"""
-        non_zero = self.W.nnz  # 稀疏矩阵的非零元素数量
+        non_zero = self.W.nnz
         return {
             'n_districts': self.n,
             'distance_threshold': self.distance_threshold,
@@ -304,7 +268,7 @@ class SpatialWeightMatrix:
             'min_neighbors': int(self.neighbor_counts.min()),
             'max_neighbors': int(self.neighbor_counts.max()),
             'isolated_districts': int((self.neighbor_counts == 0).sum()),
-            'sparsity': float(1.0 - non_zero / (self.n * self.n))  # 稀疏度
+            'sparsity': float(1.0 - non_zero / (self.n * self.n))
         }
 
 
@@ -312,12 +276,9 @@ def analyze_spatial_autocorrelation(
     Ta: np.ndarray,
     spatial_weights: SpatialWeightMatrix,
     verbose: bool = True
-) -> Dict:
+) -> Optional[Dict]:
     """
     空间滞后模型分析：水平交换项 ΔQ_A 对气温的影响
-    
-    由于 ΔQ_A（水平交换项）是气温的空间自相关项，
-    使用空间滞后模型分析相邻街区气温对本街区的影响。
     
     空间滞后模型: Ta = μ + ρ * W * Ta + ε
     
@@ -333,7 +294,7 @@ def analyze_spatial_autocorrelation(
             'intercept': 截距 μ,
             'r_squared': R² 决定系数,
             'moran_i': Moran's I 统计量,
-            'moran_p': Moran's I 的 p 值（基于正态近似）,
+            'moran_p': Moran's I 的 p 值,
             'spatial_lag': 空间滞后项 W*Ta,
             'residuals': 模型残差
         }
@@ -346,7 +307,6 @@ def analyze_spatial_autocorrelation(
         print("空间滞后模型分析（水平交换项 ΔQ_A）")
         print("=" * 60)
         
-        # 打印空间权重矩阵摘要
         summary = spatial_weights.summary()
         print(f"\n空间权重矩阵:")
         print(f"  街区数量: {summary['n_districts']}")
@@ -355,7 +315,7 @@ def analyze_spatial_autocorrelation(
         print(f"  平均邻居数: {summary['avg_neighbors']:.1f}")
         print(f"  孤立街区数: {summary['isolated_districts']}")
     
-    # 过滤有效数据（非NaN）
+    # 过滤有效数据
     valid_mask = ~np.isnan(Ta)
     n_valid = valid_mask.sum()
     
@@ -364,37 +324,31 @@ def analyze_spatial_autocorrelation(
             print("有效样本数不足，无法进行空间分析")
         return None
     
-    # 对于有 NaN 的情况，需要调整权重矩阵
     Ta_valid = Ta[valid_mask]
-    # 对于稀疏矩阵，使用布尔索引
     valid_indices = np.where(valid_mask)[0]
     W_valid = W[valid_indices[:, None], valid_indices]
     
     # 重新行标准化
     row_sums = np.array(W_valid.sum(axis=1)).flatten()
     row_sums[row_sums == 0] = 1
-    # 使用稀疏矩阵的逐元素除法
     inv_row_sums = 1.0 / row_sums
     W_valid = diags(inv_row_sums, format='csr') @ W_valid
     
-    # 计算空间滞后项 W*Ta
+    # 计算空间滞后项
     W_Ta = W_valid @ Ta_valid
     
-    # 1. 计算 Moran's I
+    # 1. Moran's I
     Ta_centered = Ta_valid - Ta_valid.mean()
     numerator = n_valid * (Ta_centered @ W_valid @ Ta_centered)
     denominator = W_valid.sum() * (Ta_centered @ Ta_centered)
     moran_i = numerator / denominator if denominator != 0 else 0
     
-    # Moran's I 期望值和方差（正态近似）
     E_I = -1 / (n_valid - 1)
     
-    # 简化的方差计算（兼容稀疏矩阵）
+    # 方差计算
     S0 = float(W_valid.sum())
-    # 对于稀疏矩阵，使用 element-wise 操作
     W_sym = W_valid + W_valid.T
     S1 = 0.5 * float((W_sym.multiply(W_sym)).sum())
-    # 计算行和列的和
     row_sums = np.array(W_valid.sum(axis=1)).flatten()
     col_sums = np.array(W_valid.sum(axis=0)).flatten()
     S2 = float(((row_sums + col_sums) ** 2).sum())
@@ -406,17 +360,13 @@ def analyze_spatial_autocorrelation(
     C = (n_valid - 1) * (n_valid - 2) * (n_valid - 3) * S0**2
     
     Var_I = (A - B) / C - E_I**2 if C != 0 else 0.01
-    Var_I = max(Var_I, 1e-10)  # 避免负方差
+    Var_I = max(Var_I, 1e-10)
     
-    # Z 统计量和 p 值
     z_score = (moran_i - E_I) / np.sqrt(Var_I)
-    moran_p = 2 * (1 - norm.cdf(abs(z_score)))  # 双尾检验
+    moran_p = 2 * (1 - norm.cdf(abs(z_score)))
     
-    # 2. 空间滞后模型: Ta = μ + ρ * W*Ta + ε
-    # 使用 OLS 估计
+    # 2. 空间滞后模型 OLS
     X = np.column_stack([np.ones(n_valid), W_Ta])
-    
-    # OLS: β = (X'X)^(-1) X'y
     XtX = X.T @ X
     XtY = X.T @ Ta_valid
     
@@ -425,21 +375,18 @@ def analyze_spatial_autocorrelation(
         intercept = beta[0]
         rho = beta[1]
     except np.linalg.LinAlgError:
-        # 矩阵奇异，使用最小二乘
         beta, _, _, _ = np.linalg.lstsq(X, Ta_valid, rcond=None)
         intercept = beta[0]
         rho = beta[1]
     
-    # 计算 R²
     y_pred = X @ beta
     ss_res = np.sum((Ta_valid - y_pred) ** 2)
     ss_tot = np.sum((Ta_valid - Ta_valid.mean()) ** 2)
     r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0
     
-    # 计算完整的空间滞后项和残差
+    # 恢复完整数组
     spatial_lag_full = np.full(n, np.nan)
     residuals_full = np.full(n, np.nan)
-    
     spatial_lag_full[valid_mask] = W_Ta
     residuals_full[valid_mask] = Ta_valid - y_pred
     
@@ -481,4 +428,3 @@ def analyze_spatial_autocorrelation(
         'n_valid_samples': n_valid,
         'spatial_weights_summary': spatial_weights.summary()
     }
-

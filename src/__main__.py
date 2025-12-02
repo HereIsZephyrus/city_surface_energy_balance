@@ -7,6 +7,7 @@
     physics:    物理计算（能量平衡系数）
     als:        ALS 回归（求解气温，输出 Ta 栅格和系数）
     spatial:    空间滞后模型分析（水平交换项 ΔQ_A）
+    overflow:   溢出效应分析（自然景观对建成区的降温溢出）
     regression: 完整回归工作流（als + spatial）
     full:       完整工作流（physics + regression）
 
@@ -16,7 +17,8 @@
     3. 能量平衡系数计算 (∂f/∂Ta, residual)
     4. ALS 回归求解各街区气温
     5. 空间滞后模型分析水平交换项
-    6. 结果输出
+    6. 溢出效应分析（可选）
+    7. 结果输出
 
 使用方法:
     # 物理计算模式
@@ -28,6 +30,9 @@
     
     # 空间滞后模型分析
     python -m src spatial --input <als_result.gpkg> -o <spatial_result.gpkg>
+    
+    # 溢出效应分析
+    python -m src overflow --input <spatial_result.gpkg> -o <overflow_result.gpkg>
     
     # 完整回归工作流（als + spatial）
     python -m src regression --cachedir <cache_dir> --districts <districts.gpkg> -o <result.gpkg>
@@ -166,12 +171,51 @@ def create_spatial_parser(subparsers):
     parser.add_argument('--distance-decay', type=str, default='binary',
                         choices=['binary', 'linear', 'inverse', 'gaussian'],
                         help='距离衰减函数 (默认: binary)')
+    parser.add_argument('--cache-dir', type=str, default=None,
+                        help='空间权重矩阵缓存目录')
     parser.add_argument('--quiet', action='store_true',
                         help='静默模式')
     
     # 输出
     parser.add_argument('-o', '--output', required=True,
                         help='输出文件路径 (.gpkg/.csv)')
+    
+    return parser
+
+
+def create_overflow_parser(subparsers):
+    """创建溢出效应分析模式的参数解析器"""
+    parser = subparsers.add_parser(
+        'overflow',
+        help='溢出效应分析 - 自然景观对建成区的降温溢出',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='分析自然景观对相邻建成区的降温溢出效应'
+    )
+    
+    # 输入
+    parser.add_argument('--input', required=True,
+                        help='spatial 模块输出文件路径 (.gpkg)')
+    
+    # 分析参数
+    parser.add_argument('--ta-column', default='Ta_optimized',
+                        help='气温列名 (默认: Ta_optimized)')
+    parser.add_argument('--lcz-column', default='LCZ',
+                        help='LCZ 列名 (默认: LCZ)')
+    parser.add_argument('--distance-threshold', type=float, default=5000.0,
+                        help='空间权重距离阈值(m) (默认: 5000)')
+    parser.add_argument('--distance-decay', type=str, default='gaussian',
+                        choices=['binary', 'linear', 'inverse', 'gaussian'],
+                        help='距离衰减函数 (默认: gaussian)')
+    parser.add_argument('--cache-dir', type=str, default=None,
+                        help='空间权重矩阵缓存目录')
+    parser.add_argument('--natural-lcz', type=str, default=None,
+                        help='自然景观 LCZ 值，逗号分隔 (默认: 11,12,13,14)')
+    parser.add_argument('--quiet', action='store_true',
+                        help='静默模式')
+    
+    # 输出
+    parser.add_argument('-o', '--output', required=True,
+                        help='输出文件路径 (.gpkg)')
     
     return parser
 
@@ -209,6 +253,8 @@ def create_regression_parser(subparsers):
     parser.add_argument('--distance-decay', type=str, default='binary',
                         choices=['binary', 'linear', 'inverse', 'gaussian'],
                         help='距离衰减函数 (默认: binary)')
+    parser.add_argument('--spatial-cache-dir', type=str, default=None,
+                        help='空间权重矩阵缓存目录')
     
     # 回归参数
     parser.add_argument('--max-iter', type=int, default=500,
@@ -287,6 +333,8 @@ def create_full_parser(subparsers):
     spatial_group.add_argument('--distance-decay', type=str, default='binary',
                                choices=['binary', 'linear', 'inverse', 'gaussian'],
                                help='距离衰减函数 (默认: binary)')
+    spatial_group.add_argument('--spatial-cache-dir', type=str, default=None,
+                               help='空间权重矩阵缓存目录')
     
     # === 缓存和输出 ===
     cache_group = parser.add_argument_group('缓存和输出')
@@ -318,6 +366,12 @@ def run_spatial(args):
     """执行空间滞后模型分析模式"""
     from .spatial import main as spatial_main
     spatial_main(args)
+
+
+def run_overflow(args):
+    """执行溢出效应分析模式"""
+    from .overflow import main as overflow_main
+    overflow_main(args)
 
 
 def run_regression(args):
@@ -367,6 +421,7 @@ def run_regression(args):
         district_id=getattr(args, 'district_id', 'district_id'),
         distance_threshold=getattr(args, 'distance_threshold', 500.0),
         distance_decay=getattr(args, 'distance_decay', 'binary'),
+        cache_dir=getattr(args, 'spatial_cache_dir', None),
         quiet=getattr(args, 'quiet', False)
     )
     
@@ -462,6 +517,7 @@ def run_full(args):
         district_id=getattr(args, 'district_id', 'district_id'),
         distance_threshold=getattr(args, 'distance_threshold', 500.0),
         distance_decay=getattr(args, 'distance_decay', 'binary'),
+        cache_dir=getattr(args, 'spatial_cache_dir', None),
         quiet=getattr(args, 'quiet', False)
     )
     
@@ -490,6 +546,7 @@ def main():
     physics     计算栅格级能量平衡系数
     als         ALS 回归求解气温（输出 Ta 栅格和系数）
     spatial     空间滞后模型分析（水平交换项 ΔQ_A）
+    overflow    溢出效应分析（自然景观对建成区的降温溢出）
     regression  完整回归工作流（als + spatial）
     full        完整工作流（physics + als + spatial）
 
@@ -503,6 +560,9 @@ def main():
     
     # 空间滞后模型分析
     python -m src spatial --input als_result.gpkg -o spatial_result.gpkg
+    
+    # 溢出效应分析
+    python -m src overflow --input spatial_result.gpkg -o overflow_result.gpkg
     
     # 完整回归工作流
     python -m src regression --cachedir ./cache --districts districts.gpkg -o result.gpkg
@@ -526,6 +586,7 @@ def main():
     create_physics_parser(subparsers)
     create_als_parser(subparsers)
     create_spatial_parser(subparsers)
+    create_overflow_parser(subparsers)
     create_regression_parser(subparsers)
     create_full_parser(subparsers)
     
@@ -544,6 +605,8 @@ def main():
         run_als(args)
     elif args.mode == 'spatial':
         run_spatial(args)
+    elif args.mode == 'overflow':
+        run_overflow(args)
     elif args.mode == 'regression':
         run_regression(args)
     elif args.mode == 'full':
