@@ -30,9 +30,49 @@ import pandas as pd
 import geopandas as gpd
 from rasterio.features import rasterize
 
+from scipy.sparse import csr_matrix
+
 from .utils.cached_collection import CachedRasterCollection
 from .regression.aggregator import DistrictAggregator
 from .regression.als_regression import ALSRegression
+
+
+def load_spatial_weights(cache_dir: str, verbose: bool = True) -> Optional[csr_matrix]:
+    """
+    从缓存加载空间权重矩阵
+    
+    参数:
+        cache_dir: 缓存目录路径
+        verbose: 是否打印信息
+        
+    返回:
+        空间权重矩阵 (csr_matrix)，如果不存在则返回 None
+    """
+    cache_path = Path(cache_dir)
+    matrix_path = cache_path / 'spatial_weights_matrix.npz'
+    
+    if not matrix_path.exists():
+        if verbose:
+            print(f"  未找到空间权重矩阵缓存: {matrix_path}")
+        return None
+    
+    try:
+        # 使用手动重建方式，避免 numpy 版本兼容性问题
+        npz = np.load(matrix_path, allow_pickle=True)
+        data = npz['data']
+        indices = npz['indices']
+        indptr = npz['indptr']
+        shape = tuple(npz['shape'])
+        W = csr_matrix((data, indices, indptr), shape=shape)
+        
+        if verbose:
+            print(f"  加载空间权重矩阵: {W.shape}, 非零元素={W.nnz}")
+        
+        return W
+    except Exception as e:
+        if verbose:
+            print(f"  加载空间权重矩阵失败: {e}")
+        return None
 
 
 # 默认聚合的栅格波段
@@ -174,6 +214,7 @@ def run_als_regression(
     X_F_columns: Optional[List[str]] = None,
     X_S_columns: Optional[List[str]] = None,
     X_C_columns: Optional[List[str]] = None,
+    spatial_weights_path: Optional[str] = None,
     max_iter: int = 100,
     tol: float = 1e-4,
     ridge_alpha: float = 0.0,
@@ -191,6 +232,9 @@ def run_als_regression(
         X_F_columns: 人为热 Q_F 相关特征列名（连续变量）
         X_S_columns: 建筑储热 ΔQ_Sb 相关特征列名（连续变量）
         X_C_columns: 分类特征列名（将进行 one-hot 编码）
+        spatial_weights_path: 空间权重矩阵缓存目录路径
+                             如果提供，将加入水平交换项 ΔQ_A = λ·(Ta - W·Ta)
+                             None 则不考虑空间效应
         max_iter: ALS最大迭代次数
         tol: 收敛容差
         ridge_alpha: 岭回归正则化参数（0表示普通最小二乘，推荐值1e3-1e6）
@@ -201,6 +245,8 @@ def run_als_regression(
             - 'Ta_per_district': 每个街区的气温
             - 'alpha_coeffs': 人为热系数
             - 'beta_coeffs': 储热系数
+            - 'lambda_coeff': 空间交换系数（如果使用空间权重）
+            - 'spatial_lag': 邻域平均气温（如果使用空间权重）
             - 'districts_result': 街区结果 GeoDataFrame
             - 'aggregated_df': 聚合后的 DataFrame
     """
@@ -387,7 +433,7 @@ def run_als_regression(
     if not has_coeff2:
         print(f"  警告: 未找到二次项系数 '{f_Ta_coeff2_column}'，将使用一次近似")
     
-    X_F, X_S, f_Ta_coeff1, f_Ta_coeff2, y_residual, era5_Ta_mean = model.prepare_regression_data(
+    X_F, X_S, f_Ta_coeff1, f_Ta_coeff2, y_residual, era5_Ta_mean, Ts_mean = model.prepare_regression_data(
         aggregated_df=aggregated_df,
         districts_gdf=districts_gdf,
         f_Ta_coeff1_column=f_Ta_coeff1_column,
@@ -406,9 +452,60 @@ def run_als_regression(
     else:
         print(f"  使用一次能量平衡方程: f(Ta) = b×Ta + c = 0")
     
+    # 加载空间权重矩阵（如果提供）
+    spatial_weights = None
+    spatial_mask = None  # 标记哪些样本在空间权重矩阵覆盖范围内
+    if spatial_weights_path:
+        print(f"\n[4.5] 加载空间权重矩阵...")
+        spatial_weights = load_spatial_weights(spatial_weights_path, verbose=verbose)
+        
+        if spatial_weights is not None:
+            n_valid = len(f_Ta_coeff1)
+            n_spatial = spatial_weights.shape[0]
+            
+            if n_spatial != n_valid:
+                print(f"  空间权重矩阵维度 ({n_spatial}) 与有效样本数 ({n_valid}) 不匹配")
+                
+                # 找出哪些有效样本在空间权重矩阵范围内
+                valid_ids = model.valid_district_ids
+                if valid_ids is not None and len(valid_ids) > 0:
+                    valid_idx = np.array(valid_ids)
+                    # 创建掩码：标记哪些样本的 ID 在空间矩阵范围内
+                    spatial_mask = valid_idx < n_spatial
+                    n_covered = np.sum(spatial_mask)
+                    
+                    if n_covered > 0:
+                        print(f"  空间权重矩阵覆盖 {n_covered}/{n_valid} 个样本 ({100*n_covered/n_valid:.1f}%)")
+                        # 提取覆盖样本对应的子矩阵
+                        covered_ids = valid_idx[spatial_mask]
+                        try:
+                            from scipy.sparse import diags
+                            sub_W = spatial_weights[covered_ids][:, covered_ids]
+                            # 重新行标准化
+                            row_sums = np.array(sub_W.sum(axis=1)).flatten()
+                            row_sums[row_sums == 0] = 1
+                            inv_row_sums = 1.0 / row_sums
+                            spatial_weights = diags(inv_row_sums, format='csr') @ sub_W
+                            print(f"  已提取子矩阵: {spatial_weights.shape}")
+                        except Exception as e:
+                            print(f"  无法提取子矩阵: {e}，禁用空间效应")
+                            spatial_weights = None
+                            spatial_mask = None
+                    else:
+                        print(f"  没有样本在空间权重矩阵覆盖范围内，禁用空间效应")
+                        spatial_weights = None
+                        spatial_mask = None
+                else:
+                    print(f"  无法获取有效样本索引，禁用空间效应")
+                    spatial_weights = None
+    
     print("\n[5] ALS 回归求解...")
     if ridge_alpha > 0:
         print(f"  使用岭回归正则化 (alpha={ridge_alpha:.2e})")
+    if spatial_weights is not None:
+        print(f"  启用空间交换项 ΔQ_A = λ·(Ta - W·Ta)")
+        if spatial_mask is not None:
+            print(f"  （仅对部分样本应用空间效应）")
     results = model.fit(
         X_F=X_F,
         X_S=X_S,
@@ -416,6 +513,9 @@ def run_als_regression(
         f_Ta_coeff2=f_Ta_coeff2,
         y_residual=y_residual,
         era5_Ta_mean=era5_Ta_mean,
+        Ts_mean=Ts_mean,
+        spatial_weights=spatial_weights,
+        spatial_mask=spatial_mask,
         max_iter=max_iter,
         tol=tol,
         ridge_alpha=ridge_alpha,
@@ -629,6 +729,8 @@ def main(args=None):
                             help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
         parser.add_argument('--x-c', type=str, default=None,
                             help='分类特征列名（将进行one-hot编码），逗号分隔')
+        parser.add_argument('--spatial-weights', type=str, default=None,
+                            help='空间权重矩阵缓存目录路径，启用水平交换项 ΔQ_A')
         parser.add_argument('--max-iter', type=int, default=100,
                             help='ALS最大迭代次数')
         parser.add_argument('--tol', type=float, default=1e-4,
@@ -666,6 +768,8 @@ def main(args=None):
         print(f"  储热特征（连续）: {X_S_columns}")
     if X_C_columns:
         print(f"  分类特征（one-hot编码）: {X_C_columns}")
+    if args.spatial_weights:
+        print(f"  空间权重矩阵: {args.spatial_weights}")
     if args.ridge_alpha > 0:
         print(f"  岭回归正则化参数: {args.ridge_alpha:.2e}")
 
@@ -679,6 +783,7 @@ def main(args=None):
             X_F_columns=X_F_columns,
             X_S_columns=X_S_columns,
             X_C_columns=X_C_columns,
+            spatial_weights_path=args.spatial_weights,
             max_iter=args.max_iter,
             tol=args.tol,
             ridge_alpha=args.ridge_alpha,

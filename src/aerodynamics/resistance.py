@@ -179,9 +179,9 @@ def calculate_aerodynamic_resistance(
     rah[bare_soil_mask] = rah_soil[bare_soil_mask]
 
     # === 情况4: 水体 (LCZ 14) - 特殊处理 ===
-    # 水面粗糙度极小（~0.0001m），使用固定粗糙度
+    # 水面粗糙度，使用固定粗糙度
     water_mask = (lcz_safe == _LCZ_WATER)
-    z0_water = 0.0001  # 静水面粗糙度
+    z0_water = 0.001  # 水面粗糙度
     rah_water = np.log(measurement_height / z0_water) / (kappa ** 2 * wind_speed_safe)
     rah[water_mask] = rah_water[water_mask]
 
@@ -267,9 +267,9 @@ def calculate_surface_resistance(
         rs[bare_soil_mask] = rs_soil
     
     # === 情况5: 水体 (LCZ 14) ===
-    # 水体表面阻抗很大（水面蒸发阻力）
+    # 开放水面蒸发阻力很小（无需穿过气孔）
     water_mask = (lcz_safe == _LCZ_WATER)
-    rs[water_mask] = 1000.0  # 水体，蒸发阻力大
+    rs[water_mask] = 5.0  # 水体，开放水面蒸发阻力小
     
     # 限制在合理范围 (30-1000 s/m)
     # 注意：保持 NaN 值不变（无效 LCZ 区域）

@@ -130,6 +130,8 @@ def create_als_parser(subparsers):
                         help='储热ΔQ_Sb特征列名（连续变量），逗号分隔')
     parser.add_argument('--x-c', type=str, default=None,
                         help='分类特征列名（将进行one-hot编码），逗号分隔')
+    parser.add_argument('--spatial-weights', type=str, default=None,
+                        help='空间权重矩阵缓存目录路径，启用水平交换项 ΔQ_A = λ·(Ta - W·Ta)')
     
     # 回归参数
     parser.add_argument('--max-iter', type=int, default=500,
